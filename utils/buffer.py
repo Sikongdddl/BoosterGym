@@ -13,6 +13,7 @@ class ExperienceBuffer:
         self.tensor_dict[name] = torch.zeros(self.horizon_length, self.num_envs, *shape, dtype=dtype, device=self.device)
 
     def update_data(self, name, idx, data):
+        print(f"self.tensor_dict['obses'].shape =", self.tensor_dict["obses"].shape)
         self.tensor_dict[name][idx, :] = data
 
     def __len__(self):

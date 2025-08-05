@@ -9,12 +9,13 @@ import signal
 import imageio
 import torch
 import torch.nn.functional as F
+
 from utils.model import *
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
 from utils.recorder import Recorder
 from envs import *
-
+from core.agents.dqn.agent import DQNAgent
 
 class Runner:
 
@@ -33,7 +34,7 @@ class Runner:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self._load()
 
-        self.buffer = ExperienceBuffer(self.cfg["runner"]["horizon_length"], self.env.num_envs, self.device)
+        self.buffer = ExperienceBuffer(self.cfg["runner"]["horizon_length"], 1, self.device)
         self.buffer.add_buffer("actions", (self.env.num_actions,))
         self.buffer.add_buffer("obses", (self.env.num_obs,))
         self.buffer.add_buffer("privileged_obses", (self.env.num_privileged_obs,))
@@ -45,7 +46,6 @@ class Runner:
         parser = argparse.ArgumentParser()
         parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
         parser.add_argument("--checkpoint", type=str, help="Path of the model checkpoint to load. Overrides config file if provided.")
-        parser.add_argument("--num_envs", type=int, help="Number of environments to create. Overrides config file if provided.")
         parser.add_argument("--headless", type=bool, help="Run headless without creating a viewer window. Overrides config file if provided.")
         parser.add_argument("--sim_device", type=str, help="Device for physics simulation. Overrides config file if provided.")
         parser.add_argument("--rl_device", type=str, help="Device for the RL algorithm. Overrides config file if provided.")
@@ -55,7 +55,7 @@ class Runner:
 
     # Override config file with args if needed
     def _update_cfg_from_args(self):
-        cfg_file = os.path.join("envs", "{}.yaml".format(self.args.task))
+        cfg_file = os.path.join("envs/chaseBall".format(self.args.task), "{}.yaml".format(self.args.task))
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
         for arg in vars(self.args):
@@ -214,18 +214,38 @@ class Runner:
                 )
             print("epoch: {}/{}".format(it + 1, self.cfg["basic"]["max_iterations"]))
 
-    def play(self):
+    def play_keyboard(self):
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         if self.cfg["viewer"]["record_video"]:
             os.makedirs("videos", exist_ok=True)
             name = time.strftime("%Y-%m-%d-%H-%M-%S.mp4", time.localtime())
             record_time = self.cfg["viewer"]["record_interval"]
+        
+        # 引入high level action控制
+        action_space = self.env.get_high_level_action_space()
+        gait_freq = action_space[3]
         while True:
+            if(infos["key_input"] == "A"):
+                action_space = [0.0,0.0,1.0,gait_freq]
+            if(infos["key_input"] == "D"):
+                action_space = [0.0,0.0,-1.0,gait_freq]
+            if(infos["key_input"] == "W"):
+                action_space = [1.0, 0.0, 0.0,gait_freq]
+            if(infos["key_input"] == "S"):
+                action_space = [-1.0, 0.0, 0.0,gait_freq]
             with torch.no_grad():
-                dist = self.model.act(obs)
+                obs_mod = obs.clone()
+                # 直接硬编码改commands三个维度的值，示例写成固定速度和角速度
+                
+                obs_mod[:, 6] = action_space[0]   # 期望x方向线速度
+                obs_mod[:, 7] = action_space[1]   # 期望y方向线速度
+                obs_mod[:, 8] = action_space[2]   # 期望角速度（绕z轴）
+
+                dist = self.model.act(obs_mod)
                 act = dist.loc
                 obs, rew, done, infos = self.env.step(act)
+                
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
             if self.cfg["viewer"]["record_video"]:
                 record_time -= self.env.dt
@@ -239,6 +259,33 @@ class Runner:
                     if self.interrupt:
                         raise KeyboardInterrupt
                     signal.signal(signal.SIGINT, signal.default_int_handler)
+                    
+    def chaseBall(self):
+        obs, infos = self.env.reset()
+        obs = obs.to(self.device)
+        # 引入high level action控制
+        action_high = self.env.get_high_level_action_space()
+        obs_high = self.env.compute_high_level_obs()
+        gait_freq = 1.5
+        agent = DQNAgent(state_dim=obs_high.shape[1], action_dim=4, device=self.device)
+        while True:
+            # introduce a policy network to get action from obs
+            # action_high = policy(obs_high)
+            action_high = [0.0, 0.0, 0.0, gait_freq]  # 默认不移动
+            with torch.no_grad():
+                #low level step first
+                obs_mod = obs.clone()
+                obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
+                obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
+                obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
+                dist = self.model.act(obs_mod)
+                act = dist.loc
+                obs, rew, done, infos = self.env.step(act)
+                obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
+            # high level step
+            obs_high = self.env.compute_high_level_obs()
+            rew_high = self.env.compute_high_level_reward()
+            # update model with rew_high
 
     def interrupt_handler(self, signal, frame):
         print("\nInterrupt received, waiting for video to finish...")

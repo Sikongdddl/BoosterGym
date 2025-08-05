@@ -16,7 +16,10 @@ class BaseTask:
         torch._C._jit_set_profiling_executor(False)
 
         self.set_viewer()
-
+        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_A, "A")
+        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_D, "D")
+        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_W, "W")
+        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_S, "S")
     def create_sim(self):
         """Creates simulation, terrain and evironments"""
         sim_cfg = self.cfg["sim"]

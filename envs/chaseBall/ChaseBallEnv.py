@@ -1,0 +1,226 @@
+import torch
+from isaacgym import gymtorch, gymapi
+from isaacgym.torch_utils import (
+    get_axis_params,
+    to_torch,
+    quat_rotate_inverse,
+)
+from envs.chaseBall.LowLevelController import LowLevelController
+
+class ChaseBallEnv:
+    def __init__(self, cfg):
+        self.controller = LowLevelController(cfg)
+        self._init_buffers()
+    
+    def _init_buffers(self):
+        self.num_obs = self.controller.cfg["env"]["num_observations"]
+        self.num_privileged_obs = self.controller.cfg["env"]["num_privileged_obs"]
+        self.num_actions = self.controller.cfg["env"]["num_actions"]
+        self.dt = self.controller.cfg["control"]["decimation"] * self.controller.cfg["sim"]["dt"]
+
+        self.obs_buf = torch.zeros(1, self.num_obs, dtype=torch.float, device=self.controller.device)
+        self.rew_buf = torch.zeros(0, dtype=torch.float, device=self.controller.device)
+        self.reset_buf = torch.zeros(1, dtype=torch.bool, device=self.controller.device)
+        self.episode_length_buf = torch.zeros(1, device=self.controller.device, dtype=torch.long)
+        self.time_out_buf = torch.zeros(1, device=self.controller.device, dtype=torch.bool)
+        self.extras = {}
+        self.extras["rew_terms"] = {}
+        self.extras["key_input"] = None
+
+        # get gym state tensors
+        actor_root_state = self.controller.gym.acquire_actor_root_state_tensor(self.controller.sim)
+        dof_state_tensor = self.controller.gym.acquire_dof_state_tensor(self.controller.sim)
+        net_contact_forces = self.controller.gym.acquire_net_contact_force_tensor(self.controller.sim)
+        body_state = self.controller.gym.acquire_rigid_body_state_tensor(self.controller.sim)
+
+        self.controller.gym.refresh_dof_state_tensor(self.controller.sim)
+        self.controller.gym.refresh_actor_root_state_tensor(self.controller.sim)
+        self.controller.gym.refresh_net_contact_force_tensor(self.controller.sim)
+        self.controller.gym.refresh_dof_force_tensor(self.controller.sim)
+        self.controller.gym.refresh_rigid_body_state_tensor(self.controller.sim)
+
+        # create some wrapper tensors for different slices
+        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        # we only care robot states instead of other assets now so:
+        self.root_states_robot = self.root_states[0:1,:]  
+        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+        self.dof_pos = self.dof_state.view(1, self.controller.num_dofs, 2)[..., 0]
+        self.dof_vel = self.dof_state.view(1, self.controller.num_dofs, 2)[..., 1]
+        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(1, -1, 3)  # shape: num_envs, num_bodies, xyz axis
+        self.body_states = gymtorch.wrap_tensor(body_state).view(1, self.controller.num_bodies_robot + self.controller.addtional_rigid_num, 13)
+        self.base_pos = self.root_states_robot[:, 0:3]
+        self.base_quat = self.root_states_robot[:, 3:7]
+        self.feet_pos = self.body_states[:, self.controller.feet_indices, 0:3]
+        self.feet_quat = self.body_states[:, self.controller.feet_indices, 3:7]
+
+        # initialize some data used later on
+        self.common_step_counter = 0
+        self.gravity_vec = to_torch(get_axis_params(-1.0, self.controller.up_axis_idx), device=self.controller.device).repeat((1, 1))
+        self.actions = torch.zeros(1, self.num_actions, dtype=torch.float, device=self.controller.device)
+        self.last_actions = torch.zeros(1, self.num_actions, dtype=torch.float, device=self.controller.device)
+        self.last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.last_root_vel = torch.zeros_like(self.root_states_robot[:, 7:13])
+        self.last_dof_targets = torch.zeros(1, self.controller.num_dofs, dtype=torch.float, device=self.controller.device)
+        self.delay_steps = torch.zeros(1, dtype=torch.long, device=self.controller.device)
+        self.torques = torch.zeros(1, self.controller.num_dofs, dtype=torch.float, device=self.controller.device)
+        self.commands = torch.zeros(1, self.controller.cfg["commands"]["num_commands"], dtype=torch.float, device=self.controller.device)
+        self.cmd_resample_time = torch.zeros(1, dtype=torch.long, device=self.controller.device)
+        self.gait_frequency = torch.zeros(1, dtype=torch.float, device=self.controller.device)
+        self.gait_process = torch.zeros(1, dtype=torch.float, device=self.controller.device)
+        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states_robot[:, 7:10])
+        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states_robot[:, 10:13])
+        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        self.filtered_lin_vel = self.base_lin_vel.clone()
+        self.filtered_ang_vel = self.base_ang_vel.clone()
+        self.curriculum_prob = torch.zeros(
+            1 + 2 * self.controller.cfg["commands"]["lin_vel_levels"],
+            1 + 2 * self.controller.cfg["commands"]["ang_vel_levels"],
+            dtype=torch.float,
+            device=self.controller.device,
+        )
+        self.curriculum_prob[self.controller.cfg["commands"]["lin_vel_levels"], self.controller.cfg["commands"]["ang_vel_levels"]] = 1.0
+        self.env_curriculum_level = torch.zeros(1, 2, dtype=torch.long, device=self.controller.device)
+        self.mean_lin_vel_level = 0.0
+        self.mean_ang_vel_level = 0.0
+        self.max_lin_vel_level = 0.0
+        self.max_ang_vel_level = 0.0
+        self.pushing_forces = torch.zeros(1, self.controller.num_bodies_robot, 3, dtype=torch.float, device=self.controller.device)
+        self.pushing_torques = torch.zeros(1, self.controller.num_bodies_robot, 3, dtype=torch.float, device=self.controller.device)
+        self.feet_roll = torch.zeros(1, len(self.controller.feet_indices), dtype=torch.float, device=self.controller.device)
+        self.feet_yaw = torch.zeros(1, len(self.controller.feet_indices), dtype=torch.float, device=self.controller.device)
+        self.last_feet_pos = torch.zeros_like(self.feet_pos)
+        self.feet_contact = torch.zeros(1, len(self.controller.feet_indices), dtype=torch.bool, device=self.controller.device)
+        self.dof_pos_ref = torch.zeros(1, self.controller.num_dofs, dtype=torch.float, device=self.controller.device)
+        self.default_dof_pos = torch.zeros(1, self.controller.num_dofs, dtype=torch.float, device=self.controller.device)
+        for i in range(self.controller.num_dofs):
+            found = False
+            for name in self.controller.cfg["init_state"]["default_joint_angles"].keys():
+                if name in self.controller.dof_names[i]:
+                    self.default_dof_pos[:, i] = self.controller.cfg["init_state"]["default_joint_angles"][name]
+                    found = True
+            if not found:
+                self.default_dof_pos[:, i] = self.controller.cfg["init_state"]["default_joint_angles"]["default"]
+
+    def reset(self):
+        return self.controller.reset(
+            self.default_dof_pos, self.dof_pos, self.dof_vel, self.dof_state, 
+            self.root_states_robot, self.root_states,
+            self.last_dof_targets, self.last_root_vel,
+            self.episode_length_buf,self.filtered_lin_vel,self.filtered_ang_vel,
+            self.cmd_resample_time, self.delay_steps, self.time_out_buf,
+            self.extras, self.commands, self.gait_frequency, self.dt,
+            self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
+
+    def pre_step(self, actions):
+        self.actions[:] = torch.clip(actions, -self.controller.cfg["normalization"]["clip_actions"], self.controller.cfg["normalization"]["clip_actions"])
+        dof_targets = self.default_dof_pos + self.controller.cfg["control"]["action_scale"] * self.actions
+        return dof_targets
+        
+    def physics_step(self,dof_targets):
+        self.torques.zero_()
+        for i in range(self.controller.cfg["control"]["decimation"]):
+            self.last_dof_targets[self.delay_steps == i] = dof_targets[self.delay_steps == i]
+            dof_torques = self.controller.dof_stiffness * (self.last_dof_targets - self.dof_pos) - self.controller.dof_damping * self.dof_vel
+            friction = torch.min(self.controller.dof_friction, dof_torques.abs()) * torch.sign(dof_torques)
+            dof_torques = torch.clip(dof_torques - friction, min=-self.controller.torque_limits, max=self.controller.torque_limits)
+            self.torques += dof_torques
+            self.controller.gym.set_dof_actuation_force_tensor(self.controller.sim, gymtorch.unwrap_tensor(dof_torques))
+            self.controller.gym.simulate(self.controller.sim)
+            if self.controller.device == "cpu":
+                self.controller.gym.fetch_results(self.controller.sim, True)
+            self.controller.gym.refresh_dof_state_tensor(self.controller.sim)
+            self.controller.gym.refresh_dof_force_tensor(self.controller.sim)
+        self.torques /= self.controller.cfg["control"]["decimation"]
+        self.controller.render()
+
+    def post_step(self):
+        self.controller.gym.refresh_actor_root_state_tensor(self.controller.sim)
+        self.controller.gym.refresh_net_contact_force_tensor(self.controller.sim)
+        self.controller.gym.refresh_rigid_body_state_tensor(self.controller.sim)
+        self.base_pos[:] = self.root_states_robot[:, 0:3]
+        self.base_quat[:] = self.root_states_robot[:, 3:7]
+        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states_robot[:, 7:10])
+        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states_robot[:, 10:13])
+        self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        self.filtered_lin_vel[:] = self.base_lin_vel[:] * self.controller.cfg["normalization"]["filter_weight"] + self.filtered_lin_vel[:] * (
+            1.0 - self.controller.cfg["normalization"]["filter_weight"]
+        )
+        self.filtered_ang_vel[:] = self.base_ang_vel[:] * self.controller.cfg["normalization"]["filter_weight"] + self.filtered_ang_vel[:] * (
+            1.0 - self.controller.cfg["normalization"]["filter_weight"]
+        )
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+        self.gait_process[:] = torch.fmod(self.gait_process + self.dt * self.gait_frequency, 1.0)
+
+        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+
+        self.controller._reset_idx(env_ids, 
+            self.default_dof_pos, self.dof_pos, self.dof_vel,self.dof_state, 
+            self.root_states_robot, self.root_states,
+            self.last_dof_targets, self.last_root_vel,
+            self.episode_length_buf,self.filtered_lin_vel,self.filtered_ang_vel,
+            self.cmd_resample_time, self.delay_steps,self.time_out_buf,
+            self.extras)
+
+        self.controller._compute_observations(self.projected_gravity,self.base_ang_vel,self.commands,
+            self.gait_frequency, self.gait_process,self.default_dof_pos,self.dof_pos, self.dof_vel, self.actions)
+
+        self.last_actions[:] = self.actions
+        self.last_dof_vel[:] = self.dof_vel
+        self.last_root_vel[:] = self.root_states_robot[:, 7:13]
+        self.last_feet_pos[:] = self.feet_pos
+
+    def compute_high_level_reward(self):
+        # 机器人底座位置
+        robot_pos = self.base_pos[0]  # shape: (3,)
+        # 球的位置在 body_states 的最后一个刚体
+        ball_idx = self.controller.num_bodies_robot  # 球的索引
+        ball_pos = self.body_states[0, ball_idx, 0:3]  # shape: (3,)
+        # 欧氏距离
+        dist = torch.norm(robot_pos - ball_pos)
+        reward = 1.0 / (dist + 1e-6)
+        #print(f"Distance to ball: {dist.item()}, Reward: {reward.item()}")
+        return torch.tensor([reward], device=self.controller.device)
+
+    def compute_high_level_obs(self):
+        # 世界坐标下的机器人和球的位置
+        robot_pos = self.base_pos[0, :3]  # (3,)
+        ball_idx = self.controller.num_bodies_robot
+        ball_pos = self.body_states[0, ball_idx, 0:3]  # (3,)
+        obs = torch.cat([robot_pos, ball_pos], dim=0).unsqueeze(0)  # shape (1,6)
+        return obs
+
+    def step(self, actions):
+        # locomotion原始step，保持不变
+        dof_targets = self.pre_step(actions)
+        self.physics_step(dof_targets)
+        self.post_step()
+        for evt in self.controller.gym.query_viewer_action_events(self.controller.viewer):
+            if evt.action == "A" and evt.value > 0:
+                self.extras["key_input"] = "A"
+                #high_action = self._key_input_to_high_level_action("A")
+            if evt.action == "D" and evt.value > 0:
+                self.extras["key_input"] = "D"
+                #high_action = self._key_input_to_high_level_action("D")
+            if evt.action == "W" and evt.value > 0:
+                self.extras["key_input"] = "W"
+                #high_action = self._key_input_to_high_level_action("W")
+            if evt.action == "S" and evt.value > 0:
+                self.extras["key_input"] = "S"
+                #high_action = self._key_input_to_high_level_action("S")
+        obs = self.controller.obs_buf
+        reward = self.compute_high_level_reward()
+        done = self.reset_buf
+        info = self.extras
+        return obs, reward, done, info
+
+    def get_high_level_action_space(self):
+        """
+        返回高层action的默认模板（4维向量），顺序为：
+        [lin_vel_x, lin_vel_y, ang_vel_yaw, gait_frequency]
+        """
+        cmd_cfg = self.controller.cfg["commands"]
+        gait_freq = 0.5 * (cmd_cfg["gait_frequency"][0] + cmd_cfg["gait_frequency"][1])
+        return [0.0, 0.0, 0.0, gait_freq]
+

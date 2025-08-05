@@ -1,0 +1,14 @@
+1.最小环境 for PPO weight load(7.9之前) 7.10完成
+2.keyboard connection for booster in minimal env（7.9之前 这个应该非常快） 7.10完成
+3.add scene assets（7.9之前 这个其实已经写出来了）
+4.modify some basic policy（7.10来写）
+
+
+0.env set(1VSball and 2VS2withBall) 7.15
+1.task domain defination 7.17
+2.task domain reward function design 7.17
+3.three new mid level policy (first do chasing_ball)
+
+reward design: distance penalty + forward reward + stop at ball front side
+pipeline还没拉起来倒是 争取明天晚上之前能写出来一个可以完整开始训练的代码
+terminal:mid level policy -> command -> low level policy -> action -> success
