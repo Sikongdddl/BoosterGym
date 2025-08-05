@@ -1,4 +1,4 @@
-Copyright [2024] [Booster Robotics Technology Co., Ltd ("Booster Robotics")]
+Copyright [2025] [jrgong SJTU AI Institute]
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,3 +20,4 @@ This code builds upon following open-source code-bases. Please visit the URLs to
 2) https://github.com/leggedrobotics/legged_gym
 3) https://github.com/leggedrobotics/rsl_rl
 4) https://github.com/roboterax/humanoid-gym
+5) https://github.com/BoosterRobotics/booster_gym
