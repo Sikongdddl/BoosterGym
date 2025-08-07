@@ -264,39 +264,62 @@ class Runner:
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         gait_freq = 1.5
-        obs_high = self.env.compute_high_level_obs()
+        obs_high = self.env.compute_high_level_obs().to(self.device)
         action_high = [0.0, 0.0, 0.0, gait_freq]
         agent = DQNAgent(state_dim=obs_high.shape[1], action_dim=4, device=self.device)
+        
+        episode_step = 0
+        episode_return = 0
+        max_steps = 100
 
         while True:
-            # introduce a policy network to get action from obs# 引入high level action控制
-            obs_high = self.env.compute_high_level_obs()
-            action_high_id = agent.select_action(obs_high.cpu().numpy())
+            # high level observation and action
+            obs_high = self.env.compute_high_level_obs().to(self.device)
+            obs_high_np = obs_high.squeeze(0).cpu().numpy()
+            action_high_id = agent.select_action(obs_high_np)
             action_high = self.env.high_level_action_id_to_vector(action_high_id)
+            # low level inference
             with torch.no_grad():
                 #low level step first
                 obs_mod = obs.clone()
                 obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
                 obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
                 obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
+                
                 dist = self.model.act(obs_mod)
                 act = dist.loc
                 obs, rew, done, infos = self.env.step(act)
-                obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
+                obs = obs.to(self.device)
+            
             # high level step
-            next_obs_high = self.env.compute_high_level_obs()
-            rew_high = self.env.compute_high_level_reward()
+            next_obs_high = self.env.compute_high_level_obs().to(self.device)
+            next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
+            rew_high = self.env.compute_high_level_reward().item()
+
+            # statistics
+            episode_step += 1
+            episode_return += rew_high
+            done_high = episode_step > max_steps or rew_high > 0.5
+
             # save transitions to buffer
             agent.push(
-                obs_high.cpu().numpy().squeeze(0),
+                obs_high_np,
                 action_high_id,
-                rew_high.item(),
-                next_obs_high.cpu().numpy().squeeze(0),
-                False # always false at high level for done flag
+                rew_high,
+                next_obs_high_np,
+                done_high
             )
             print("got dumb buffer:", len(agent.replay_buffer))
 
-            # optimize model with rew_high
+            if done_high:
+                print(f"[Episode End] Return: {episode_return:.2f}, Step: {episode_step}")
+                episode_step = 0
+                episode_return = 0
+                obs, infos = self.env.reset()
+                obs = obs.to(self.device)
+            
+            # optimize model
+            agent.update()
             
 
     def interrupt_handler(self, signal, frame):
