@@ -318,7 +318,7 @@ class Runner:
                 obs, infos = self.env.reset()
                 obs = obs.to(self.device)
             
-            # optimize model
+            # optimize model 
             agent.update()
             
 

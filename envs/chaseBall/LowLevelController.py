@@ -129,7 +129,7 @@ class LowLevelController(BaseTask):
         env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
         self.envs = []
         self.actor_handles = []
-        self.base_mass_scaled = torch.zeros(1, 4, dtype=torch.float, device=self.device)
+
         env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(1)))
         booster_start_pose.p = gymapi.Vec3(0.0,0.0,0.0) # origin
         actor_handle = self.gym.create_actor(env_handle, robot_asset, booster_start_pose, booster_asset_cfg["name"], 0, booster_asset_cfg["self_collisions"], 0)
@@ -137,13 +137,17 @@ class LowLevelController(BaseTask):
         # 8 add reachable ball
         ball_pose = gymapi.Transform()
         ball_pose.p = gymapi.Vec3(1,0.0,ball_radius + 0.01)
-        ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "SoccerBall",0,0)
+        self.ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "SoccerBall",0,0)
         self.addtional_rigid_num += 1
+        # print(f"Total number of rigid bodies: {self.num_bodies_robot}")
+        # print(f"Total number of rigid bodies after ball creation: {self.num_bodies_robot + self.addtional_rigid_num}")
 
         # 9 add other assets
         self.addtional_rigid_num += create_strip_grass(self,env_handle,length=40.0,width=25.0,num_strips=15)
         self.addtional_rigid_num += create_field_boundary_lines(self,env_handle,length=40.0,width=25.0,line_width=0.15)
         self.addtional_rigid_num += create_field_auxiliary_lines(self, env_handle, length=40,width=25)
+
+        # print(f"Total number of rigid bodies in the env: {self.num_bodies_robot + self.addtional_rigid_num}")
 
         body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
         for j in range(self.num_bodies_robot):
@@ -208,7 +212,7 @@ class LowLevelController(BaseTask):
 
         self._reset_dofs(env_ids, default_dof_pos, dof_pos, dof_vel,dof_state)
         self._reset_root_states(env_ids, root_states_robot, root_states)
-
+        self._reset_ball_positions(env_ids, root_states)
         last_dof_targets[env_ids] = dof_pos[env_ids]
         last_root_vel[env_ids] = root_states_robot[env_ids, 7:13]
         episode_length_buf[env_ids] = 0
@@ -244,6 +248,28 @@ class LowLevelController(BaseTask):
             torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
             self.cfg["randomization"].get("init_base_lin_vel_xy"),
         )
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
+
+    def _reset_ball_positions(self, env_ids, root_states):
+        """
+        重置球的位置到初始点或随机点。
+        """
+        # 获取球的初始高度和xy范围
+        ball_z = 0.12  # 球半径+地面偏移，可根据实际场地调整
+        ball_x_range = [0.5, 2.0]  # 可自定义
+        ball_y_range = [-1.0, 1.0]
+        # 获取root_states（所有刚体，包括球）
+        # 球的索引是 self.num_bodies_robot
+        for eid in env_ids:
+            x = np.random.uniform(ball_x_range[0], ball_x_range[1])
+            y = np.random.uniform(ball_y_range[0], ball_y_range[1])
+            # 只改球的xyz位置 idx0 is robot and idx1 is ball in root_states [58,13]
+            root_states[1, 0] = x
+            root_states[1, 1] = y
+            root_states[1, 2] = ball_z
+            # 球速度清零
+            root_states[1, 7:13] = 0.0
+        # 写回仿真
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
 
     def _resample_commands(self,
@@ -296,3 +322,4 @@ class LowLevelController(BaseTask):
             ),
             dim=-1,
         )
+

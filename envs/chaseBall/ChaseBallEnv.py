@@ -1,10 +1,16 @@
 import torch
+import numpy as np
 from isaacgym import gymtorch, gymapi
 from isaacgym.torch_utils import (
     get_axis_params,
     to_torch,
     quat_rotate_inverse,
+    quat_from_euler_xyz,
+    torch_rand_float,
+    get_euler_xyz,
+    quat_rotate,
 )
+
 from envs.chaseBall.LowLevelController import LowLevelController
 
 class ChaseBallEnv:
@@ -41,6 +47,7 @@ class ChaseBallEnv:
 
         # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        
         # we only care robot states instead of other assets now so:
         self.root_states_robot = self.root_states[0:1,:]  
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
@@ -102,7 +109,7 @@ class ChaseBallEnv:
                 self.default_dof_pos[:, i] = self.controller.cfg["init_state"]["default_joint_angles"]["default"]
 
     def reset(self):
-        return self.controller.reset(
+        obs, infos = self.controller.reset(
             self.default_dof_pos, self.dof_pos, self.dof_vel, self.dof_state, 
             self.root_states_robot, self.root_states,
             self.last_dof_targets, self.last_root_vel,
@@ -110,6 +117,7 @@ class ChaseBallEnv:
             self.cmd_resample_time, self.delay_steps, self.time_out_buf,
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
+        return obs, infos
 
     def pre_step(self, actions):
         self.actions[:] = torch.clip(actions, -self.controller.cfg["normalization"]["clip_actions"], self.controller.cfg["normalization"]["clip_actions"])
@@ -176,6 +184,7 @@ class ChaseBallEnv:
         robot_pos = self.base_pos[0]  # shape: (3,)
         # 球的位置在 body_states 的最后一个刚体
         ball_idx = self.controller.num_bodies_robot  # 球的索引
+
         ball_pos = self.body_states[0, ball_idx, 0:3]  # shape: (3,)
         # 欧氏距离
         dist = torch.norm(robot_pos - ball_pos)
@@ -237,3 +246,24 @@ class ChaseBallEnv:
         }
         return self.action_table.get(action_id, [0.0, 0.0, 0.0, 1.5])
 
+    def debug_print_positions(self):
+        # 假设你只有一个env实例，env_id=0
+        env_id = 0
+
+        # 机器人刚体数目
+        num_robot_bodies = self.controller.num_bodies_robot
+
+        # 打印机器人各刚体位置（取前三个坐标）
+        print(f"Robot body positions (env {env_id}):")
+        for i in range(num_robot_bodies):
+            pos = self.body_states[env_id, i, 0:3]
+            print(f"  Body {i}: x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}")
+
+        # 球的刚体索引
+        ball_idx = num_robot_bodies
+        ball_pos = self.body_states[env_id, ball_idx, 0:3]
+        print(f"Ball position (env {env_id}): x={ball_pos[0]:.3f}, y={ball_pos[1]:.3f}, z={ball_pos[2]:.3f}")
+
+        # 打印机器人底座位置
+        base_pos = self.base_pos[env_id, :3]
+        print(f"Robot base position (env {env_id}): x={base_pos[0]:.3f}, y={base_pos[1]:.3f}, z={base_pos[2]:.3f}")
