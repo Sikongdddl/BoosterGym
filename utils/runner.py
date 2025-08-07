@@ -273,7 +273,6 @@ class Runner:
             obs_high = self.env.compute_high_level_obs()
             action_high_id = agent.select_action(obs_high.cpu().numpy())
             action_high = self.env.high_level_action_id_to_vector(action_high_id)
-            print("dumb action_high =", action_high)
             with torch.no_grad():
                 #low level step first
                 obs_mod = obs.clone()
@@ -285,9 +284,20 @@ class Runner:
                 obs, rew, done, infos = self.env.step(act)
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
             # high level step
-            obs_high = self.env.compute_high_level_obs()
+            next_obs_high = self.env.compute_high_level_obs()
             rew_high = self.env.compute_high_level_reward()
-            # update model with rew_high
+            # save transitions to buffer
+            agent.push(
+                obs_high.cpu().numpy().squeeze(0),
+                action_high_id,
+                rew_high.item(),
+                next_obs_high.cpu().numpy().squeeze(0),
+                False # always false at high level for done flag
+            )
+            print("got dumb buffer:", len(agent.replay_buffer))
+
+            # optimize model with rew_high
+            
 
     def interrupt_handler(self, signal, frame):
         print("\nInterrupt received, waiting for video to finish...")
