@@ -263,15 +263,17 @@ class Runner:
     def chaseBall(self):
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
-        # 引入high level action控制
-        action_high = self.env.get_high_level_action_space()
-        obs_high = self.env.compute_high_level_obs()
         gait_freq = 1.5
+        obs_high = self.env.compute_high_level_obs()
+        action_high = [0.0, 0.0, 0.0, gait_freq]
         agent = DQNAgent(state_dim=obs_high.shape[1], action_dim=4, device=self.device)
+
         while True:
-            # introduce a policy network to get action from obs
-            # action_high = policy(obs_high)
-            action_high = [0.0, 0.0, 0.0, gait_freq]  # 默认不移动
+            # introduce a policy network to get action from obs# 引入high level action控制
+            obs_high = self.env.compute_high_level_obs()
+            action_high_id = agent.select_action(obs_high.cpu().numpy())
+            action_high = self.env.high_level_action_id_to_vector(action_high_id)
+            print("dumb action_high =", action_high)
             with torch.no_grad():
                 #low level step first
                 obs_mod = obs.clone()

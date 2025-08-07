@@ -224,3 +224,16 @@ class ChaseBallEnv:
         gait_freq = 0.5 * (cmd_cfg["gait_frequency"][0] + cmd_cfg["gait_frequency"][1])
         return [0.0, 0.0, 0.0, gait_freq]
 
+    def high_level_action_id_to_vector(self,action_id):
+        """
+        将DQN高层action的ID转换为向量形式
+        due to the discrete action space, the action_id is a single integer
+        """
+        self.action_table = {
+            0: [0.0, 0.0, 0.0, 1.5],  # 前进
+            1: [0.0, 0.0, 1.0, 1.5],  # 向右转
+            2: [0.0, 0.0, -1.0, 1.5], # 向左转
+            3: [0.0, 0.0, 0.0, 1.5],   # 停止
+        }
+        return self.action_table.get(action_id, [0.0, 0.0, 0.0, 1.5])
+
