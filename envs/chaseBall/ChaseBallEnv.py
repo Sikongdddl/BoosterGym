@@ -180,17 +180,38 @@ class ChaseBallEnv:
         self.last_feet_pos[:] = self.feet_pos
 
     def compute_high_level_reward(self):
-        # 机器人底座位置
-        robot_pos = self.base_pos[0]  # shape: (3,)
-        # 球的位置在 body_states 的最后一个刚体
-        ball_idx = self.controller.num_bodies_robot  # 球的索引
+        device = self.controller.device
 
-        ball_pos = self.body_states[0, ball_idx, 0:3]  # shape: (3,)
-        # 欧氏距离
-        dist = torch.norm(robot_pos - ball_pos)
-        reward = 1.0 / (dist + 1e-6)
-        #print(f"Distance to ball: {dist.item()}, Reward: {reward.item()}")
-        return torch.tensor([reward], device=self.controller.device)
+        # ---- 位置 ----
+        robot_pos = self.base_pos[0, :3]                 # (3,)
+        ball_idx  = self.controller.num_bodies_robot
+        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
+
+        # ---- 平面向量 ----
+        delta = ball_pos - robot_pos
+        delta_xy = delta[:2]
+        dist_xy = torch.norm(delta_xy)
+        to_ball_xy = delta_xy / (dist_xy + 1e-6)         # 单位向量
+
+        # ---- 机体前向（只看 XY）----
+        # 如果资产前向不是 +X，改这里即可：如 [0, 1, 0] 或 [0, -1, 0]
+        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)  # 假设 +X 为前
+        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)  # (3,)
+        fwd_xy = fwd_world[:2]
+        fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)   # 单位向量
+
+        # ---- 纯 XY 的朝向余弦 ----
+        heading_cos = torch.clamp(torch.dot(fwd_xy, to_ball_xy), -1.0, 1.0)
+        heading_reward = 0.5 * (heading_cos + 1.0)      # 映射到 [0,1]
+
+        # ---- 距离奖励（也用平面距离更一致）----
+        dist_reward = torch.exp(-dist_xy)
+
+        # ---- 合成 ----
+        time_penalty = 0.01
+        reward = 1.0 * dist_reward + 0.3 * heading_reward - time_penalty
+        return reward.view(1).to(device)
+
 
     def compute_high_level_obs(self):
         # 世界坐标下的机器人和球的位置

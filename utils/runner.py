@@ -270,7 +270,7 @@ class Runner:
         
         episode_step = 0
         episode_return = 0
-        max_steps = 100
+        max_steps = 200
 
         while True:
             # high level observation and action
@@ -299,7 +299,7 @@ class Runner:
             # statistics
             episode_step += 1
             episode_return += rew_high
-            done_high = episode_step > max_steps or rew_high > 0.5
+            done_high = episode_step > max_steps or rew_high > 5.0
 
             # save transitions to buffer
             agent.push(
@@ -309,7 +309,7 @@ class Runner:
                 next_obs_high_np,
                 done_high
             )
-            print("got dumb buffer:", len(agent.replay_buffer))
+            #print(f"got reward: {rew_high:.2f}, step: {episode_step}, action: {action_high_id}, done: {done_high}")
 
             if done_high:
                 print(f"[Episode End] Return: {episode_return:.2f}, Step: {episode_step}")
