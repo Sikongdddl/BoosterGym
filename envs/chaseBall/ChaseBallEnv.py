@@ -210,6 +210,9 @@ class ChaseBallEnv:
         # ---- 合成 ----
         time_penalty = 0.01
         reward = 1.0 * dist_reward + 0.3 * heading_reward - time_penalty
+
+        self.extras["rew_terms"]["heading_cos"] = heading_cos.detach()
+        self.extras["rew_terms"]["dist_xy"] = dist_xy.detach()
         return reward.view(1).to(device)
 
 

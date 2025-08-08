@@ -10,13 +10,14 @@ import imageio
 import torch
 import torch.nn.functional as F
 
+
 from utils.model import *
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
 from utils.recorder import Recorder
 from envs import *
 from core.agents.dqn.agent import DQNAgent
-
+from core.utils.logger import TBLogger
 class Runner:
 
     def __init__(self, test=False):
@@ -41,6 +42,7 @@ class Runner:
         self.buffer.add_buffer("rewards", ())
         self.buffer.add_buffer("dones", (), dtype=bool)
         self.buffer.add_buffer("time_outs", (), dtype=bool)
+
 
     def _get_args(self):
         parser = argparse.ArgumentParser()
@@ -261,6 +263,15 @@ class Runner:
                     signal.signal(signal.SIGINT, signal.default_int_handler)
                     
     def chaseBall(self):
+        # tensorboard logger
+        run_name = f"{self.cfg['basic']['task']}_{time.strftime('%Y%m%d-%H%M%S')}"
+        tb = TBLogger(
+            logdir="logs/tb",
+            run_name=run_name
+        )
+        global_step = 0
+
+        # init
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         gait_freq = 1.5
@@ -271,57 +282,82 @@ class Runner:
         episode_step = 0
         episode_return = 0
         max_steps = 200
+        episode_idx = 0
 
-        while True:
-            # high level observation and action
-            obs_high = self.env.compute_high_level_obs().to(self.device)
-            obs_high_np = obs_high.squeeze(0).cpu().numpy()
-            action_high_id = agent.select_action(obs_high_np)
-            action_high = self.env.high_level_action_id_to_vector(action_high_id)
-            # low level inference
-            with torch.no_grad():
-                #low level step first
-                obs_mod = obs.clone()
-                obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
-                obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
-                obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
+        try:
+            while True:
+                # high level observation and action
+                obs_high = self.env.compute_high_level_obs().to(self.device)
+                obs_high_np = obs_high.squeeze(0).cpu().numpy()
+                action_high_id = agent.select_action(obs_high_np)
+                action_high = self.env.high_level_action_id_to_vector(action_high_id)
                 
-                dist = self.model.act(obs_mod)
-                act = dist.loc
-                obs, rew, done, infos = self.env.step(act)
-                obs = obs.to(self.device)
-            
-            # high level step
-            next_obs_high = self.env.compute_high_level_obs().to(self.device)
-            next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
-            rew_high = self.env.compute_high_level_reward().item()
+                # low level inference
+                with torch.no_grad():
+                    #low level step first
+                    obs_mod = obs.clone()
+                    obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
+                    obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
+                    obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
+                    
+                    dist = self.model.act(obs_mod)
+                    act = dist.loc
+                    obs, rew, done, infos = self.env.step(act)
+                    obs = obs.to(self.device)
+                
+                # high level step
+                next_obs_high = self.env.compute_high_level_obs().to(self.device)
+                next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
+                rew_high = self.env.compute_high_level_reward().item()
 
-            # statistics
-            episode_step += 1
-            episode_return += rew_high
-            done_high = episode_step > max_steps or rew_high > 5.0
+                # statistics
+                episode_step += 1
+                episode_return += rew_high
+                done_high = episode_step > max_steps or rew_high > 5.0
 
-            # save transitions to buffer
-            agent.push(
-                obs_high_np,
-                action_high_id,
-                rew_high,
-                next_obs_high_np,
-                done_high
-            )
-            #print(f"got reward: {rew_high:.2f}, step: {episode_step}, action: {action_high_id}, done: {done_high}")
+                # save transitions to buffer
+                agent.push(
+                    obs_high_np,
+                    action_high_id,
+                    rew_high,
+                    next_obs_high_np,
+                    done_high
+                )
 
-            if done_high:
-                print(f"[Episode End] Return: {episode_return:.2f}, Step: {episode_step}")
-                episode_step = 0
-                episode_return = 0
-                obs, infos = self.env.reset()
-                obs = obs.to(self.device)
-            
-            # optimize model 
-            agent.update()
-            
+                # tensorboard logging
+                tb.set_step(global_step)
+                tb.add_scalar("high/reward",rew_high)
+                tb.add_scalar("high/action_id", action_high_id)
+                tb.add_scalar("high/episode_return_running", episode_return)
+                tb.add_scalar("high/episode_idx_running", episode_idx, step=global_step)
+                
+                if "rew_terms" in infos:
+                    terms = infos["rew_terms"]
+                    if isinstance(terms, dict):
+                        if "heading_cos" in terms:
+                            tb.add_scalar("high/heading_cos", float(terms["heading_cos"]))
+                        if "dist_xy" in terms:
+                            tb.add_scalar("high/dist_xy", float(terms["dist_xy"]))
+                global_step += 1
 
+                # episode end
+                if done_high:
+                    tb.add_scalars("high/episode", {
+                        "return": episode_return,
+                        "length": episode_step,
+                    })
+                    tb.add_scalar("high/episode_idx", episode_idx)
+                    print(f"[Episode End] Return: {episode_return:.2f}, Step: {episode_step}")
+                    episode_idx += 1
+                    episode_step = 0
+                    episode_return = 0
+                    obs, infos = self.env.reset()
+                    obs = obs.to(self.device)
+
+                # optimize model 
+                agent.update()
+        finally:
+            tb.close()
     def interrupt_handler(self, signal, frame):
         print("\nInterrupt received, waiting for video to finish...")
         self.interrupt = True
