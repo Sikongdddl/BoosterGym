@@ -215,7 +215,22 @@ class ChaseBallEnv:
         self.extras["rew_terms"]["dist_xy"] = dist_xy.detach()
         return reward.view(1).to(device)
 
-
+    def apply_high_level_command(self, cmd, smooth=None):
+        """
+        cmd: [lin_vel_x, lin_vel_y, ang_vel_yaw, gait_freq]
+        smooth: 可选的低通平滑系数 alpha∈[0,1)，None 表示直写
+        """
+        device = self.controller.device
+        # 三个速度指令
+        new_cmd = torch.tensor(cmd[:3], device=device, dtype=self.commands.dtype).view(1, 3)
+        if smooth is None:
+            self.commands[:, :3] = new_cmd
+            self.gait_frequency[:] = float(cmd[3])
+        else:
+            alpha = float(smooth)
+            self.commands[:, :3] = alpha * self.commands[:, :3] + (1 - alpha) * new_cmd
+            self.gait_frequency[:] = alpha * self.gait_frequency + (1 - alpha) * float(cmd[3])
+    
     def compute_high_level_obs(self):
         # 世界坐标下的机器人和球的位置
         robot_pos = self.base_pos[0, :3]  # (3,)

@@ -90,22 +90,9 @@ class LowLevelController(BaseTask):
                     found = True
             if not found:
                 raise ValueError(f"PD gain of joint {self.dof_names[i]} were not defined")
-        self.dof_stiffness = apply_randomization(self.dof_stiffness, self.cfg["randomization"].get("dof_stiffness"))
-        self.dof_damping = apply_randomization(self.dof_damping, self.cfg["randomization"].get("dof_damping"))
-        self.dof_friction = apply_randomization(self.dof_friction, self.cfg["randomization"].get("dof_friction"))
 
         # === 4. body names & index
-        body_names = self.gym.get_asset_rigid_body_names(robot_asset)
-        
-        termination_contact_names = []
-        for name in self.cfg["rewards"]["terminate_contacts_on"]:
-            termination_contact_names.extend([s for s in body_names if name in s])
         self.base_indice = self.gym.find_asset_rigid_body_index(robot_asset, booster_asset_cfg["base_name"])
-
-        # prepare termination contact indices
-        self.termination_contact_indices = torch.zeros(len(termination_contact_names), dtype=torch.long, device=self.device)
-        for i in range(len(termination_contact_names)):
-            self.termination_contact_indices[i] = self.gym.find_asset_rigid_body_index(robot_asset, termination_contact_names[i])
 
         # === 5. shape indices
         rbs_list = self.gym.get_asset_rigid_body_shape_indices(robot_asset)
@@ -193,8 +180,7 @@ class LowLevelController(BaseTask):
             episode_length_buf,filtered_lin_vel,filtered_ang_vel,
             cmd_resample_time, delay_steps,time_out_buf,
             extras)
-        self._resample_commands(episode_length_buf, 
-            cmd_resample_time, commands,gait_frequency, dt)
+        
         self._compute_observations(projected_gravity,base_ang_vel, commands,
             gait_frequency, gait_process,default_dof_pos,dof_pos, dof_vel, actions)
         return self.obs_buf, extras
@@ -226,7 +212,7 @@ class LowLevelController(BaseTask):
     def _reset_dofs(self, env_ids, 
         default_dof_pos, dof_pos, dof_vel,dof_state):
 
-        dof_pos[env_ids] = apply_randomization(default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
+        dof_pos[env_ids] = default_dof_pos[env_ids]
         dof_vel[env_ids] = 0.0
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
@@ -237,17 +223,12 @@ class LowLevelController(BaseTask):
         root_states_robot, root_states):
 
         root_states_robot[env_ids] = self.base_init_state
-        root_states_robot[env_ids, :2] = apply_randomization(root_states_robot[env_ids, :2], self.cfg["randomization"].get("init_base_pos_xy"))
-        root_states_robot[env_ids, 2] += self.terrain.terrain_heights(root_states_robot[env_ids, :2])
         root_states_robot[env_ids, 3:7] = quat_from_euler_xyz(
             torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
             torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-            torch.rand(len(env_ids), device=self.device) * (2 * torch.pi),
+            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
         )
-        root_states_robot[env_ids, 7:9] = apply_randomization(
-            torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
-            self.cfg["randomization"].get("init_base_lin_vel_xy"),
-        )
+        root_states_robot[env_ids, 7:13] = 0.0  # reset base linear and angular velocities
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
 
     def _reset_ball_positions(self, env_ids, root_states):
@@ -263,7 +244,7 @@ class LowLevelController(BaseTask):
         for eid in env_ids:
             x = np.random.uniform(ball_x_range[0], ball_x_range[1])
             y = np.random.uniform(ball_y_range[0], ball_y_range[1])
-            # 只改球的xyz位置 idx0 is robot and idx1 is ball in root_states [58,13]
+            # 只改球的xyz位置 idx0 is robot， idx1 is ball
             root_states[1, 0] = x
             root_states[1, 1] = y
             root_states[1, 2] = ball_z
@@ -271,34 +252,6 @@ class LowLevelController(BaseTask):
             root_states[1, 7:13] = 0.0
         # 写回仿真
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
-
-    def _resample_commands(self,
-        episode_length_buf, cmd_resample_time, commands,gait_frequency,dt):
-
-        env_ids = (episode_length_buf == cmd_resample_time).nonzero(as_tuple=False).flatten()
-        if len(env_ids) == 0:
-            return
-        commands[env_ids, 0] = torch_rand_float(
-            self.cfg["commands"]["lin_vel_x"][0], self.cfg["commands"]["lin_vel_x"][1], (len(env_ids), 1), device=self.device
-        ).squeeze(1)
-        commands[env_ids, 1] = torch_rand_float(
-            self.cfg["commands"]["lin_vel_y"][0], self.cfg["commands"]["lin_vel_y"][1], (len(env_ids), 1), device=self.device
-        ).squeeze(1)
-        commands[env_ids, 2] = torch_rand_float(
-            self.cfg["commands"]["ang_vel_yaw"][0], self.cfg["commands"]["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device
-        ).squeeze(1)
-        gait_frequency[env_ids] = torch_rand_float(
-            self.cfg["commands"]["gait_frequency"][0], self.cfg["commands"]["gait_frequency"][1], (len(env_ids), 1), device=self.device
-        ).squeeze(1)
-        still_envs = env_ids[torch.randperm(len(env_ids))[: int(self.cfg["commands"]["still_proportion"] * len(env_ids))]]
-        commands[still_envs, :] = 0.0
-        gait_frequency[still_envs] = 0.0
-        cmd_resample_time[env_ids] += torch.randint(
-            int(self.cfg["commands"]["resampling_time_s"][0] / dt),
-            int(self.cfg["commands"]["resampling_time_s"][1] / dt),
-            (len(env_ids),),
-            device=self.device,
-        )
 
     def _compute_observations(self,
         projected_gravity,base_ang_vel,commands,
