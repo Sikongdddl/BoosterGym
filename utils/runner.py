@@ -10,7 +10,6 @@ import imageio
 import torch
 import torch.nn.functional as F
 
-
 from utils.model import *
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
@@ -18,6 +17,8 @@ from utils.recorder import Recorder
 from envs import *
 from core.agents.dqn.agent import DQNAgent
 from core.utils.logger import TBLogger
+from eval.chaseBallEvaluator import ChaseBallEvaluator
+
 class Runner:
 
     def __init__(self, test=False):
@@ -249,18 +250,6 @@ class Runner:
                 obs, rew, done, infos = self.env.step(act)
                 
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
-            if self.cfg["viewer"]["record_video"]:
-                record_time -= self.env.dt
-                if record_time < 0:
-                    record_time += self.cfg["viewer"]["record_interval"]
-                    self.interrupt = False
-                    signal.signal(signal.SIGINT, self.interrupt_handler)
-                    with imageio.get_writer(os.path.join("videos", name), fps=int(1.0 / self.env.dt)) as self.writer:
-                        for frame in self.env.camera_frames:
-                            self.writer.append_data(frame)
-                    if self.interrupt:
-                        raise KeyboardInterrupt
-                    signal.signal(signal.SIGINT, signal.default_int_handler)
                     
     def chaseBall(self):
         # tensorboard logger
@@ -283,6 +272,11 @@ class Runner:
         episode_return = 0
         max_steps = 200
         episode_idx = 0
+
+        self.evaluator = evaluator = ChaseBallEvaluator(
+            max_steps=200, 
+            success_dist_thresh=0.4,
+             tb_prefix="eval")
 
         try:
             while True:
@@ -340,6 +334,18 @@ class Runner:
                             tb.add_scalar("high/dist_xy", float(terms["dist_xy"]))
                 global_step += 1
 
+                # evaluate every 100 episodes
+                if episode_step % 100 == 0:
+                    metrics = self.evaluator.evaluate(
+                        env = self.env,
+                        low_model = self.model,
+                        high_agent = agent,
+                        device = self.device,
+                        episodes = 5,
+                        tb = tb
+                    )
+                    print(f"[Eval @ step {episode_idx}] {metrics}")
+
                 # episode end
                 if done_high:
                     tb.add_scalars("high/episode", {
@@ -358,6 +364,3 @@ class Runner:
                 agent.update()
         finally:
             tb.close()
-    def interrupt_handler(self, signal, frame):
-        print("\nInterrupt received, waiting for video to finish...")
-        self.interrupt = True
