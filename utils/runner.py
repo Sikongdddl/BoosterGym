@@ -16,6 +16,8 @@ from utils.utils import discount_values, surrogate_loss
 from utils.recorder import Recorder
 from envs import *
 from core.agents.dqn.agent import DQNAgent
+from core.utils.logger import TBLogger
+from eval.chaseBallEvaluator import ChaseBallEvaluator
 
 class Runner:
 
@@ -41,6 +43,7 @@ class Runner:
         self.buffer.add_buffer("rewards", ())
         self.buffer.add_buffer("dones", (), dtype=bool)
         self.buffer.add_buffer("time_outs", (), dtype=bool)
+
 
     def _get_args(self):
         parser = argparse.ArgumentParser()
@@ -247,46 +250,5 @@ class Runner:
                 obs, rew, done, infos = self.env.step(act)
                 
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
-            if self.cfg["viewer"]["record_video"]:
-                record_time -= self.env.dt
-                if record_time < 0:
-                    record_time += self.cfg["viewer"]["record_interval"]
-                    self.interrupt = False
-                    signal.signal(signal.SIGINT, self.interrupt_handler)
-                    with imageio.get_writer(os.path.join("videos", name), fps=int(1.0 / self.env.dt)) as self.writer:
-                        for frame in self.env.camera_frames:
-                            self.writer.append_data(frame)
-                    if self.interrupt:
-                        raise KeyboardInterrupt
-                    signal.signal(signal.SIGINT, signal.default_int_handler)
                     
-    def chaseBall(self):
-        obs, infos = self.env.reset()
-        obs = obs.to(self.device)
-        # 引入high level action控制
-        action_high = self.env.get_high_level_action_space()
-        obs_high = self.env.compute_high_level_obs()
-        gait_freq = 1.5
-        agent = DQNAgent(state_dim=obs_high.shape[1], action_dim=4, device=self.device)
-        while True:
-            # introduce a policy network to get action from obs
-            # action_high = policy(obs_high)
-            action_high = [0.0, 0.0, 0.0, gait_freq]  # 默认不移动
-            with torch.no_grad():
-                #low level step first
-                obs_mod = obs.clone()
-                obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
-                obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
-                obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
-                dist = self.model.act(obs_mod)
-                act = dist.loc
-                obs, rew, done, infos = self.env.step(act)
-                obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
-            # high level step
-            obs_high = self.env.compute_high_level_obs()
-            rew_high = self.env.compute_high_level_reward()
-            # update model with rew_high
-
-    def interrupt_handler(self, signal, frame):
-        print("\nInterrupt received, waiting for video to finish...")
-        self.interrupt = True
+    

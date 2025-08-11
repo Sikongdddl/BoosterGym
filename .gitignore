@@ -1,0 +1,10 @@
+# Tensorboard logs
+logs/
+logs/**
+runs
+runs/**
+
+# python cache
+__pycache__/
+
+
