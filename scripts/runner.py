@@ -93,7 +93,7 @@ class Runner:
         # ----- 可调参数 -----
         ACTION_REPEAT = 10  # <<< 高层动作重复次数，建议先试 5~10
         WARMUP = 5000   # <<< 低层模型 warmup 步数
-        UPDATE_k = 1    # <<< 低层模型更新频率
+        UPDATE_K = 1    # <<< 低层模型更新频率
 
         # init
         obs, infos = self.env.reset()
@@ -213,6 +213,8 @@ class Runner:
                         if "spin_penalty" in terms:
                             tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
 
+                global_step += 1
+                
                 # evaluate every 100 episodes
                 if episode_idx % 100 == 0 and episode_idx != 0:
                     metrics = self.evaluator.evaluate(
