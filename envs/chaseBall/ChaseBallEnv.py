@@ -32,6 +32,8 @@ class ChaseBallEnv:
         self.time_out_buf = torch.zeros(1, device=dev, dtype=torch.bool)
         self.extras = {"rew_terms": {}}
 
+        self._prev_dist_xy = None  # 用于计算进步奖励
+
         # get gym state tensors
         actor_root_state = self.controller.gym.acquire_actor_root_state_tensor(self.controller.sim)
         dof_state_tensor = self.controller.gym.acquire_dof_state_tensor(self.controller.sim)
@@ -99,6 +101,7 @@ class ChaseBallEnv:
             self.cmd_resample_time, self.delay_steps, self.time_out_buf,
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
+        self._prev_dist_xy = None  # 重置进步奖励计算
         return obs, infos
 
     def pre_step(self, actions):
@@ -163,38 +166,79 @@ class ChaseBallEnv:
     def compute_high_level_reward(self):
         device = self.controller.device
 
-        # ---- 位置 ----
-        robot_pos = self.base_pos[0, :3]                 # (3,)
+        # --- 位姿 ---
+        robot_pos = self.base_pos[0, :3]
         ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
+        ball_pos  = self.body_states[0, ball_idx, 0:3]
 
-        # ---- 平面向量 ----
         delta = ball_pos - robot_pos
         delta_xy = delta[:2]
-        dist_xy = torch.norm(delta_xy)
-        to_ball_xy = delta_xy / (dist_xy + 1e-6)         # 单位向量
+        dist_xy = torch.norm(delta_xy) + 1e-6
+        to_ball_xy = delta_xy / dist_xy
 
-        # ---- 机体前向（只看 XY）----
-        # 如果资产前向不是 +X，改这里即可：如 [0, 1, 0] 或 [0, -1, 0]
-        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)  # 假设 +X 为前
-        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)  # (3,)
+        # --- 机体前向（仅XY）---
+        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)
+        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)
         fwd_xy = fwd_world[:2]
-        fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)   # 单位向量
-
-        # ---- 纯 XY 的朝向余弦 ----
+        fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
         heading_cos = torch.clamp(torch.dot(fwd_xy, to_ball_xy), -1.0, 1.0)
-        heading_reward = 0.5 * (heading_cos + 1.0)      # 映射到 [0,1]
+        heading_reward = 0.5 * (heading_cos + 1.0)  # [0,1]
 
-        # ---- 距离奖励（也用平面距离更一致）----
-        dist_reward = torch.exp(-dist_xy)
+        # --- 速度分解 ---
+        v_xy = self.base_lin_vel[0, :2]
+        speed_toward = torch.dot(v_xy, to_ball_xy)     # 朝球速度(可正可负)
+        # 与球方向正交的单位向量
+        to_ball_perp = torch.stack([-to_ball_xy[1], to_ball_xy[0]])
+        speed_orth = torch.dot(v_xy, to_ball_perp)     # 侧滑速度
+        speed_reward = torch.tanh(0.8 * speed_toward)  # 平滑压缩到 [-1,1]
 
-        # ---- 合成 ----
-        time_penalty = 0.01
-        reward = 1.0 * dist_reward + 0.3 * heading_reward - time_penalty
+        # --- 反转圈：朝向球速度很小但角速度很大，判定为原地转圈 ---
+        yaw_rate = self.base_ang_vel[0, 2]             # 机体z轴角速度
+        spinning = (torch.abs(speed_toward) < 0.02) * (torch.abs(yaw_rate) > 0.8)
+        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=device))
+        spin_penalty = torch.clamp(spin_penalty, 0.0, 3.0)
 
-        self.extras["rew_terms"]["heading_cos"] = heading_cos.detach()
-        self.extras["rew_terms"]["dist_xy"] = dist_xy.detach()
+        # --- 进步奖励：标准化差分，尺度稳定 ---
+        prev_dist = getattr(self, "_prev_dist_xy", None)
+        if prev_dist is None:
+            progress = torch.tensor(0.0, device=device)
+            progress_norm = torch.tensor(0.0, device=device)
+        else:
+            raw = (prev_dist - dist_xy)
+            progress = torch.clamp(raw, -1.0, 1.0)
+            progress_norm = torch.clamp(raw / (prev_dist + 1e-6), -1.0, 1.0)
+        self._prev_dist_xy = dist_xy.detach()
+
+        # --- 成功判定与奖励（加大力度） ---
+        success_thresh = 0.45
+        success = (dist_xy < success_thresh)
+        success_bonus = 20.0 if success else 0.0   # << 加大
+
+        # --- 合成（权重可微调） ---
+        # 侧滑惩罚、原地转圈惩罚都只扣非负值
+        time_penalty = 0.001
+        reward = (
+            1.0 * progress_norm          # 稳定尺度的进步
+        + 0.3 * heading_reward         # 对准
+        + 0.7 * speed_reward           # 朝球移动
+        - 0.2 * torch.abs(speed_orth)  # 抑制侧滑
+        - 0.2 * spin_penalty           # 抑制原地瞎转
+        + success_bonus
+        - time_penalty
+        )
+
+        # logging
+        self.extras["rew_terms"]["heading_cos"]   = heading_cos.detach()
+        self.extras["rew_terms"]["dist_xy"]       = dist_xy.detach()
+        self.extras["rew_terms"]["progress"]      = progress.detach()
+        self.extras["rew_terms"]["progress_norm"] = progress_norm.detach()
+        self.extras["rew_terms"]["speed_toward"]  = speed_toward.detach()
+        self.extras["rew_terms"]["speed_orth"]    = speed_orth.detach()
+        self.extras["rew_terms"]["spin_penalty"]  = spin_penalty.detach()
+        self.extras["success"] = bool(success)
+
         return reward.view(1).to(device)
+
 
     def apply_high_level_command(self, cmd, smooth=None):
         """
@@ -213,12 +257,48 @@ class ChaseBallEnv:
             self.gait_frequency[:] = alpha * self.gait_frequency + (1 - alpha) * float(cmd[3])
     
     def compute_high_level_obs(self):
-        # 世界坐标下的机器人和球的位置
-        robot_pos = self.base_pos[0, :3]  # (3,)
-        ball_idx = self.controller.num_bodies_robot
-        ball_pos = self.body_states[0, ball_idx, 0:3]  # (3,)
-        obs = torch.cat([robot_pos, ball_pos], dim=0).unsqueeze(0)  # shape (1,6)
-        return obs
+        """
+        高层观测（自车系，相对量），返回 shape (1, 8)
+        各分量：
+        0-1: delta_xy_body（球在自车坐标系的XY相对位置）
+        2:   dist_xy（平面距离）
+        3-4: cos(bearing), sin(bearing)（指向球的方位角）
+        5-6: v_body_xy（自车系下机体线速度XY）
+        7:   speed_toward（沿着指向球方向的速度分量）
+        """
+        device = self.controller.device
+
+        # 取世界系位姿
+        robot_pos = self.base_pos[0, :3]                 # (3,)
+        ball_idx  = self.controller.num_bodies_robot
+        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
+
+        # 世界 -> 自车系：把相对位移旋到机体坐标系
+        delta_world = ball_pos - robot_pos               # (3,)
+        # quat_rotate_inverse 接受 (N,3)，这里用 (1,3) 再 squeeze
+        delta_body  = quat_rotate_inverse(self.base_quat[0:1], delta_world[None, :]).squeeze(0)  # (3,)
+        delta_xy_body = delta_body[:2]                   # (2,)
+
+        # 距离 & 方位
+        dist_xy = torch.norm(delta_xy_body) + 1e-6
+        bearing = torch.atan2(delta_xy_body[1], delta_xy_body[0])   # 自车系下的方位角
+        cos_b   = torch.cos(bearing)
+        sin_b   = torch.sin(bearing)
+
+        # 自车系速度 & 朝向球的速度分量
+        v_body_xy = self.base_lin_vel[0, :2]             # 这本来就是在自车系（你在 post_step 里已做了 quat_rotate_inverse）
+        speed_toward = v_body_xy[0] * cos_b + v_body_xy[1] * sin_b
+
+        # 拼接观测向量
+        obs_vec = torch.stack((
+            delta_xy_body[0], delta_xy_body[1],
+            dist_xy, cos_b, sin_b,
+            v_body_xy[0], v_body_xy[1],
+            speed_toward,
+        ), dim=0)  # (8,)
+
+        return obs_vec.unsqueeze(0)  # (1, 8)
+
 
     def step(self, actions):
         # locomotion原始step，保持不变
@@ -258,13 +338,17 @@ class ChaseBallEnv:
         将DQN高层action的ID转换为向量形式
         due to the discrete action space, the action_id is a single integer
         """
+        VX_FWD = 0.25
+        YAW = 0.8
+        FREQ = 1.5
+
         self.action_table = {
-            0: [0.0, 0.0, 0.0, 1.5],  # 前进
-            1: [0.0, 0.0, 1.0, 1.5],  # 向右转
-            2: [0.0, 0.0, -1.0, 1.5], # 向左转
-            3: [0.0, 0.0, 0.0, 1.5],   # 停止
+            0: [VX_FWD, 0.0, 0.0, FREQ],  # 前进
+            1: [0.0, 0.0, +YAW, FREQ],  # 向右转
+            2: [0.0, 0.0, -YAW, FREQ], # 向左转
+            3: [0.0, 0.0, 0.0, FREQ],   # 停止
         }
-        return self.action_table.get(action_id, [0.0, 0.0, 0.0, 1.5])
+        return self.action_table.get(int(action_id), [0.0, 0.0, 0.0, FREQ])
 
     def debug_print_positions(self):
         # 假设你只有一个env实例，env_id=0

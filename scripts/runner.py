@@ -89,6 +89,11 @@ class Runner:
             run_name=run_name
         )
         global_step = 0
+        
+        # ----- 可调参数 -----
+        ACTION_REPEAT = 10  # <<< 高层动作重复次数，建议先试 5~10
+        WARMUP = 5000   # <<< 低层模型 warmup 步数
+        UPDATE_k = 1    # <<< 低层模型更新频率
 
         # init
         obs, infos = self.env.reset()
@@ -100,45 +105,69 @@ class Runner:
         
         episode_step = 0
         episode_return = 0
-        max_steps = 200
+        max_steps = 500
         episode_idx = 0
 
         self.evaluator = evaluator = ChaseBallEvaluator(
-            max_steps=200, 
-            success_dist_thresh=0.4,
-             tb_prefix="eval")
+            max_steps=500, 
+            success_dist_thresh=0.5,
+            tb_prefix="eval")
 
         try:
             while True:
                 # high level observation and action
                 obs_high = self.env.compute_high_level_obs().to(self.device)
                 obs_high_np = obs_high.squeeze(0).cpu().numpy()
+                
+                # 选动作前先算一眼Q用于记录（不影响选择的epsilon逻辑）
+                with torch.no_grad():
+                    q_vals = agent.q_net(torch.as_tensor(obs_high_np, dtype=torch.float32, device=self.device).unsqueeze(0))
+                    q_max  = float(q_vals.max().item())
+                    q_mean = float(q_vals.mean().item())
+                
                 action_high_id = agent.select_action(obs_high_np)
+                q_selected = float(q_vals[0, action_high_id].item())
                 action_high = self.env.high_level_action_id_to_vector(action_high_id)
                 self.env.apply_high_level_command(action_high)
+                
                 # low level inference
-                with torch.no_grad():
-                    #low level step first
-                    obs_mod = obs.clone()
-                    obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
-                    obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
-                    obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
-                    
-                    dist = self.model.act(obs_mod)
-                    act = dist.loc
-                    obs, rew, done, infos = self.env.step(act)
-                    obs = obs.to(self.device)
+                acc_rew_high = 0.0
+                last_infos = infos
+                success_happened = False
+
+                for _ in range(ACTION_REPEAT):
+                    with torch.no_grad():
+                        #low level step first
+                        obs_mod = obs.clone()
+                        obs_mod[:, 6] = action_high[0]   # 期望x方向线速度
+                        obs_mod[:, 7] = action_high[1]   # 期望y方向线速度
+                        obs_mod[:, 8] = action_high[2]   # 期望角速度（绕z轴）
+                        
+                        dist = self.model.act(obs_mod)
+                        act = dist.loc
+                        obs, rew, done, infos = self.env.step(act)
+                        obs = obs.to(self.device)
+                        last_infos = infos
+
+                    step_rew_high = self.env.compute_high_level_reward().item()
+                    acc_rew_high += step_rew_high
+
+                    if isinstance(infos, dict) and infos.get("success", False):
+                        success_happened = True
+                        break
+
+                    if done:
+                        break
                 
                 # high level step
                 next_obs_high = self.env.compute_high_level_obs().to(self.device)
                 next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
-                rew_high = self.env.compute_high_level_reward().item()
+                rew_high = acc_rew_high if success_happened else (acc_rew_high / ACTION_REPEAT)
 
                 # statistics
                 episode_step += 1
                 episode_return += rew_high
-                done_high = episode_step > max_steps or rew_high > 5.0
-
+                done_high = episode_step > max_steps or success_happened
                 # save transitions to buffer
                 agent.push(
                     obs_high_np,
@@ -150,19 +179,39 @@ class Runner:
 
                 # tensorboard logging
                 tb.set_step(global_step)
-                tb.add_scalar("high/reward",rew_high)
+                env_frames = global_step * ACTION_REPEAT
+                tb.add_scalar("train/env_frames", env_frames)
+                tb.add_scalar("train/action_repeat", ACTION_REPEAT)
+                tb.add_scalar("train/replay_size", len(agent.replay_buffer))
+                tb.add_scalar("train/epsilon", agent.epsilon)
+                tb.add_scalar("train/update_steps", agent.step_count)
+
+                # 高层行为/Q值
                 tb.add_scalar("high/action_id", action_high_id)
-                tb.add_scalar("high/episode_return_running", episode_return)
-                tb.add_scalar("high/episode_idx_running", episode_idx, step=global_step)
-                
-                if "rew_terms" in infos:
-                    terms = infos["rew_terms"]
+                tb.add_scalar("high/reward", rew_high)
+                tb.add_scalar("high/q_max", q_max)
+                tb.add_scalar("high/q_mean", q_mean)
+                tb.add_scalar("high/q_selected", q_selected)
+                tb.add_scalar("high/success", float(success_happened))
+
+                # 奖励分解项（来自 env.extras）
+                if isinstance(last_infos, dict):
+                    terms = last_infos.get("rew_terms", {})
                     if isinstance(terms, dict):
-                        if "heading_cos" in terms:
-                            tb.add_scalar("high/heading_cos", float(terms["heading_cos"]))
                         if "dist_xy" in terms:
-                            tb.add_scalar("high/dist_xy", float(terms["dist_xy"]))
-                global_step += 1
+                            tb.add_scalar("rew/dist_xy", float(terms["dist_xy"]))
+                        if "heading_cos" in terms:
+                            tb.add_scalar("rew/heading_cos", float(terms["heading_cos"]))
+                        if "progress" in terms:
+                            tb.add_scalar("rew/progress", float(terms["progress"]))
+                        if "progress_norm" in terms:
+                            tb.add_scalar("rew/progress_norm", float(terms["progress_norm"]))
+                        if "speed_toward" in terms:
+                            tb.add_scalar("rew/speed_toward", float(terms["speed_toward"]))
+                        if "speed_orth" in terms:
+                            tb.add_scalar("rew/speed_orth", float(terms["speed_orth"]))
+                        if "spin_penalty" in terms:
+                            tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
 
                 # evaluate every 100 episodes
                 if episode_idx % 100 == 0 and episode_idx != 0:
@@ -181,8 +230,8 @@ class Runner:
                     tb.add_scalars("high/episode", {
                         "return": episode_return,
                         "length": episode_step,
+                        "success": float(success_happened),
                     })
-                    tb.add_scalar("high/episode_idx", episode_idx)
                     print(f"[Episode End] Return: {episode_return:.2f}, Step: {episode_step}")
                     episode_idx += 1
                     episode_step = 0
@@ -191,6 +240,10 @@ class Runner:
                     obs = obs.to(self.device)
 
                 # optimize model 
-                agent.update()
+                if len(agent.replay_buffer) >= WARMUP:
+                    for _ in range(UPDATE_K):
+                        did_update, loss_val = agent.update()
+                        if did_update and loss_val is not None:
+                            tb.add_scalar("train/loss", loss_val)
         finally:
             tb.close()

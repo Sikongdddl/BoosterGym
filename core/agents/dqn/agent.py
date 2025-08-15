@@ -20,10 +20,11 @@ class DQNAgent:
         self.batch_size = 64
         self.epsilon = 1.0
         self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.998
         self.target_update_freq = 10
         self.step_count = 0
         self.action_dim = action_dim
+        self.last_loss = None
 
     def select_action(self, state):
         if np.random.rand() < self.epsilon:
@@ -38,7 +39,7 @@ class DQNAgent:
 
     def update(self):
         if len(self.replay_buffer) < self.batch_size:
-            return
+            return False, None
 
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
         states = torch.FloatTensor(states).to(self.device)
@@ -53,7 +54,6 @@ class DQNAgent:
             target_q = rewards + (1 - dones) * self.gamma * next_q
 
         loss = F.mse_loss(q_values, target_q)
-
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -63,3 +63,5 @@ class DQNAgent:
 
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         self.step_count += 1
+        self.last_loss = float(loss.item())
+        return True, self.last_loss
