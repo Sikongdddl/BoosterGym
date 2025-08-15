@@ -127,7 +127,9 @@ class ChaseBallEnv:
             self.controller.gym.refresh_dof_state_tensor(self.controller.sim)
             self.controller.gym.refresh_dof_force_tensor(self.controller.sim)
         self.torques /= self.controller.cfg["control"]["decimation"]
-        self.controller.render()
+        
+        if getattr(self.controller, 'viewer', None) is not None:
+            self.controller.render()
 
     def post_step(self):
         self.controller.gym.refresh_actor_root_state_tensor(self.controller.sim)
@@ -305,19 +307,7 @@ class ChaseBallEnv:
         dof_targets = self.pre_step(actions)
         self.physics_step(dof_targets)
         self.post_step()
-        for evt in self.controller.gym.query_viewer_action_events(self.controller.viewer):
-            if evt.action == "A" and evt.value > 0:
-                self.extras["key_input"] = "A"
-                #high_action = self._key_input_to_high_level_action("A")
-            if evt.action == "D" and evt.value > 0:
-                self.extras["key_input"] = "D"
-                #high_action = self._key_input_to_high_level_action("D")
-            if evt.action == "W" and evt.value > 0:
-                self.extras["key_input"] = "W"
-                #high_action = self._key_input_to_high_level_action("W")
-            if evt.action == "S" and evt.value > 0:
-                self.extras["key_input"] = "S"
-                #high_action = self._key_input_to_high_level_action("S")
+
         obs = self.controller.obs_buf
         reward = self.compute_high_level_reward()
         done = self.reset_buf
@@ -338,7 +328,7 @@ class ChaseBallEnv:
         将DQN高层action的ID转换为向量形式
         due to the discrete action space, the action_id is a single integer
         """
-        VX_FWD = 0.25
+        VX_FWD = 0.40
         YAW = 0.8
         FREQ = 1.5
 

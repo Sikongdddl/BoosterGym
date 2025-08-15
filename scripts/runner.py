@@ -149,14 +149,14 @@ class Runner:
                         obs = obs.to(self.device)
                         last_infos = infos
 
-                    step_rew_high = self.env.compute_high_level_reward().item()
+                    step_rew_high = float(rew)
                     acc_rew_high += step_rew_high
 
                     if isinstance(infos, dict) and infos.get("success", False):
                         success_happened = True
                         break
 
-                    if done:
+                    if torch.any(done).item():
                         break
                 
                 # high level step
