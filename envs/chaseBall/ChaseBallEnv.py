@@ -347,6 +347,8 @@ class ChaseBallEnv:
             1: [0.0, 0.0, +YAW, FREQ],  # 向右转
             2: [0.0, 0.0, -YAW, FREQ], # 向左转
             3: [0.0, 0.0, 0.0, FREQ],   # 停止
+            4: [VX_FWD, 0.0, +0.5*YAW, FREQ], # 前进并稍微向右转
+            5: [VX_FWD, 0.0, -0.5*YAW, FREQ], # 前进并稍微向左转
         }
         return self.action_table.get(int(action_id), [0.0, 0.0, 0.0, FREQ])
 

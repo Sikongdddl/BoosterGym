@@ -101,7 +101,7 @@ class Runner:
         gait_freq = 1.5
         obs_high = self.env.compute_high_level_obs().to(self.device)
         action_high = [0.0, 0.0, 0.0, gait_freq]
-        agent = DQNAgent(state_dim=obs_high.shape[1], action_dim=4, device=self.device)
+        agent = DQNAgent(state_dim=obs_high.shape[1], action_dim=6, device=self.device)
         
         episode_step = 0
         episode_return = 0
@@ -214,7 +214,7 @@ class Runner:
                             tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
 
                 global_step += 1
-                
+
                 # evaluate every 100 episodes
                 if episode_idx % 100 == 0 and episode_idx != 0:
                     metrics = self.evaluator.evaluate(
