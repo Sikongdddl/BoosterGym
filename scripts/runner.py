@@ -225,7 +225,7 @@ class Runner:
                     if isinstance(infos, dict) and infos.get("success", False):
                         success_happened = True
                         break
-                    if isinstance(infos, dict) and infos.get("fall", True):
+                    if isinstance(infos, dict) and infos.get("fall", False):
                         fall_happened = True
                         break
 
