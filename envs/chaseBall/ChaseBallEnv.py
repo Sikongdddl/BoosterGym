@@ -165,6 +165,13 @@ class ChaseBallEnv:
         self.last_dof_vel[:] = self.dof_vel
         self.last_root_vel[:] = self.root_states_robot[:, 7:13]
 
+        # check fall early stop
+        if self._is_fallen():
+            self.reset_buf[:] = True
+            self.extras["fall"] = True
+        else:
+            self.extras["fall"] = False
+
     def compute_high_level_reward(self):
         device = self.controller.device
 
@@ -219,6 +226,8 @@ class ChaseBallEnv:
         # --- 合成（权重可微调） ---
         # 侧滑惩罚、原地转圈惩罚都只扣非负值
         time_penalty = 0.001
+        # 摔倒惩罚
+        fallen_penalty = 10.0 if self.extras.get("fall", False) else 0.0
         reward = (
             1.0 * progress_norm          # 稳定尺度的进步
         + 0.3 * heading_reward         # 对准
@@ -227,6 +236,7 @@ class ChaseBallEnv:
         - 0.2 * spin_penalty           # 抑制原地瞎转
         + success_bonus
         - time_penalty
+        - fallen_penalty              # 摔倒惩罚
         )
 
         # logging
@@ -240,7 +250,6 @@ class ChaseBallEnv:
         self.extras["success"] = bool(success)
 
         return reward.view(1).to(device)
-
 
     def apply_high_level_command(self, cmd, smooth=None):
         """
@@ -301,7 +310,6 @@ class ChaseBallEnv:
 
         return obs_vec.unsqueeze(0)  # (1, 8)
 
-
     def step(self, actions):
         # locomotion原始step，保持不变
         dof_targets = self.pre_step(actions)
@@ -342,6 +350,22 @@ class ChaseBallEnv:
         }
         return self.action_table.get(int(action_id), [0.0, 0.0, 0.0, FREQ])
 
+    def _is_fallen(self):
+        # height threshold of base
+        base_z = float(self.base_pos[0, 2])
+        z_threshold = 0.2
+        low_z = base_z < z_threshold
+
+        # angular threshold of robot
+        device = self.controller.device
+        WORLD_UP = torch.tensor([0.0, 0.0, 1.0], device=device)
+        up_body = quat_rotate(self.base_quat[0:1], WORLD_UP[None, :]).squeeze(0)
+        cos_tilt = torch.clamp(up_body[2], -1.0, 1.0)  # [-1, 1]
+        tilt = torch.arccos(cos_tilt)
+        tilt_threshold = 0.75
+        large_tilt = tilt > tilt_threshold
+
+        return low_z or large_tilt
     def debug_print_positions(self):
         # 假设你只有一个env实例，env_id=0
         env_id = 0
@@ -363,3 +387,4 @@ class ChaseBallEnv:
         # 打印机器人底座位置
         base_pos = self.base_pos[env_id, :3]
         print(f"Robot base position (env {env_id}): x={base_pos[0]:.3f}, y={base_pos[1]:.3f}, z={base_pos[2]:.3f}")
+
