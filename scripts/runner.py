@@ -111,8 +111,22 @@ class Runner:
         self.evaluator = evaluator = ChaseBallEvaluator(
             max_steps=500, 
             success_dist_thresh=0.5,
-            tb_prefix="eval")
+            tb_prefix="eval",
+            save_dir = os.path.join("logs", "ckpt"),
+            save_best_by = "success_rate",
+            higher_is_better = True,
+            save_every_eval = False,
+        )
 
+        metrix = evaluator.evaluate(
+            env=self.env,
+            low_model=self.model,
+            high_agent=agent,
+            device=self.device,
+            episodes=5,
+            tb=tb,
+            global_step = global_step,
+        )
         try:
             while True:
                 # high level observation and action
