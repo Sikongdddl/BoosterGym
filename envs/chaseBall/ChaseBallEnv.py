@@ -148,6 +148,14 @@ class ChaseBallEnv:
         self.common_step_counter += 1
         self.gait_process[:] = torch.fmod(self.gait_process + self.dt * self.gait_frequency, 1.0)
 
+        # check fall early stop
+        fall_now = self._is_fallen()
+        if fall_now:
+            self.reset_buf[:] = True
+            self.extras["fall"] = True
+        else:
+            self.extras["fall"] = False
+
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
 
         self.controller._reset_idx(env_ids, 
@@ -158,19 +166,22 @@ class ChaseBallEnv:
             self.cmd_resample_time, self.delay_steps,self.time_out_buf,
             self.extras)
 
-        self.controller._compute_observations(self.projected_gravity,self.base_ang_vel,self.commands,
-            self.gait_frequency, self.gait_process,self.default_dof_pos,self.dof_pos, self.dof_vel, self.actions)
+        if env_ids.numel() > 0:
+            self.reset_buf[env_ids] = False
+            self.time_out_buf[env_ids] = False
+            # 进步奖励基线清空（下一回合第一步不做错误差分）
+            self._prev_dist_xy = None
+            # 防止高层读到上回合的摔倒标志
+            self.extras["fall"] = False
+
+        self.controller._compute_observations(
+            self.projected_gravity,self.base_ang_vel,self.commands,
+            self.gait_frequency, self.gait_process,
+            self.default_dof_pos,self.dof_pos, self.dof_vel, self.actions)
 
         self.last_actions[:] = self.actions
         self.last_dof_vel[:] = self.dof_vel
         self.last_root_vel[:] = self.root_states_robot[:, 7:13]
-
-        # check fall early stop
-        if self._is_fallen():
-            self.reset_buf[:] = True
-            self.extras["fall"] = True
-        else:
-            self.extras["fall"] = False
 
     def compute_high_level_reward(self):
         device = self.controller.device
@@ -310,6 +321,34 @@ class ChaseBallEnv:
 
         return obs_vec.unsqueeze(0)  # (1, 8)
 
+    def get_dist_xy(self, frame: str = "world"):
+        """
+        返回机器人与球的平面距离（单位：米）。
+        frame:
+        - "world": 直接用世界坐标 (默认)
+        - "body" : 先把相对位移旋到自车系再取范数
+        返回: Python float
+        """
+        # 取位姿
+        robot_pos = self.base_pos[0, :3]                 # (3,)
+        ball_idx  = self.controller.num_bodies_robot
+        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
+
+        delta_world = ball_pos - robot_pos               # (3,)
+
+        if frame == "world":
+            dist_xy = torch.norm(delta_world[:2])        # torch scalar
+        else:
+            # 旋到机体系
+            delta_body = quat_rotate_inverse(self.base_quat[0:1], delta_world[None, :]).squeeze(0)
+            dist_xy = torch.norm(delta_body[:2])
+
+        # 护航，避免偶发 NaN 干扰日志
+        if torch.isnan(dist_xy) or torch.isinf(dist_xy):
+            dist_xy = torch.tensor(float("nan"), device=dist_xy.device)
+
+        return float(dist_xy.item())
+        
     def step(self, actions):
         # locomotion原始step，保持不变
         dof_targets = self.pre_step(actions)
@@ -366,6 +405,7 @@ class ChaseBallEnv:
         large_tilt = tilt > tilt_threshold
 
         return low_z or large_tilt
+
     def debug_print_positions(self):
         # 假设你只有一个env实例，env_id=0
         env_id = 0

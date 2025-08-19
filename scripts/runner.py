@@ -222,12 +222,14 @@ class Runner:
                     step_rew_high = float(rew) 
                     acc_rew_high += step_rew_high
 
-                    if isinstance(infos, dict) and infos.get("success", False):
-                        success_happened = True
-                        break
                     if isinstance(infos, dict) and infos.get("fall", False):
-                        fall_happened = True
+                        fall_happened = True      
                         break
+
+                    if isinstance(infos, dict) and infos.get("success", False):
+                        success_happened = True     
+                        break
+                    
 
                     if torch.any(done).item():
                         break
@@ -266,6 +268,8 @@ class Runner:
                 tb.add_scalar("train/action_repeat", ACTION_REPEAT)
                 tb.add_scalar("train/replay_size", len(agent.replay_buffer))
 
+                dist_now_world = self.env.get_dist_xy(frame="world")
+                tb.add_scalar("train/dist_xy", dist_now_world)
                 # 按算法记录
                 if mode == "discrete":
                     tb.add_scalar("dqn/epsilon", getattr(agent, "epsilon", 0.0))

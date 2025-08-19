@@ -107,16 +107,39 @@ class RLEvaluator:
         acc = {"min_dist_xy": float("inf"), "heading_sum": 0.0, "heading_cnt": 0, "final_dist_xy": None}
 
         while True:
-            # 高层确定性动作
+            # —— 高层确定性动作（DQN=离散，SAC=连续）
             obs_high = env.compute_high_level_obs().to(device)
             obs_high_np = obs_high.squeeze(0).cpu().numpy()
-            try:
-                action_id = high_agent.select_action(obs_high_np, eval_mode=True)
-            except TypeError:
-                action_id = high_agent.select_action(obs_high_np)
-            cmd = env.high_level_action_id_to_vector(action_id)
 
-            # 低层（分布均值）
+            try:
+                a = high_agent.select_action(obs_high_np, eval_mode=True)
+            except TypeError:
+                a = high_agent.select_action(obs_high_np)
+
+            # 分支：离散 or 连续
+            is_discrete = np.isscalar(a) or isinstance(a, (int, np.integer))
+            if is_discrete:
+                action_id = int(a)
+                cmd = env.high_level_action_id_to_vector(action_id)
+                # 离散命令通常不用平滑
+                env.apply_high_level_command(cmd)
+                if tb: tb.add_scalar(f"{self.tb_prefix}/action_id", action_id)
+            else:
+                a_np = np.asarray(a).reshape(-1)
+                # 可做安全裁剪（若 agent 未内部裁剪）
+                # 如果你的 SACAgent 暴露了 action_low/high，可以用它们；这里给个兜底：
+                a_np = np.clip(a_np, -1e3, 1e3)  # 或者直接不裁剪
+
+                gait_freq = 1.5
+                cmd = [float(a_np[0]), float(a_np[1]), float(a_np[2]), gait_freq]
+                # 连续命令建议平滑，防止抖动/摔倒
+                env.apply_high_level_command(cmd, smooth=0.5)
+                if tb:
+                    tb.add_scalar(f"{self.tb_prefix}/action_vx", float(cmd[0]))
+                    tb.add_scalar(f"{self.tb_prefix}/action_vy", float(cmd[1]))
+                    tb.add_scalar(f"{self.tb_prefix}/action_yaw", float(cmd[2]))
+
+            # —— 低层（分布均值）
             obs_mod = obs.clone()
             obs_mod[:, 6], obs_mod[:, 7], obs_mod[:, 8] = cmd[0], cmd[1], cmd[2]
             dist = low_model.act(obs_mod)
@@ -124,13 +147,13 @@ class RLEvaluator:
             obs, rew, _, infos = env.step(act)
             obs = obs.to(device)
 
-            # 子类指标（不二次调用 reward）
+            # —— 评估指标/奖励
             m = self.compute_step_metrics(env, infos)
             r = float(rew) if "reward" not in m else float(m["reward"])
             ep_ret += r
             steps += 1
 
-            # 诊断累计
+            # —— 诊断记录（可选）
             if "dist_xy" in m:
                 d = float(m["dist_xy"])
                 acc["final_dist_xy"] = d
@@ -142,9 +165,8 @@ class RLEvaluator:
                 if tb: tb.add_scalar(f"{self.tb_prefix}/heading_cos", float(m["heading_cos"]))
             if tb:
                 tb.add_scalar(f"{self.tb_prefix}/reward", r)
-                tb.add_scalar(f"{self.tb_prefix}/action_id", action_id)
 
-            # 结束
+            # —— 结束条件
             reach_max = (steps >= self.max_steps)
             success_now = self.is_success(acc)
             if reach_max or success_now:
