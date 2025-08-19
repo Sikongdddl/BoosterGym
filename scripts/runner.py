@@ -54,9 +54,12 @@ class Runner:
                     self.cfg["env"][arg] = getattr(self.args, arg)
                 else:
                     self.cfg["basic"][arg] = getattr(self.args, arg)
-        if "algo" not in self.cfg["basic"]:
-            self.cfg["basic"]["algo"] = "dqn"
-        
+        self.cfg["basic"].setdefault("algo", "dqn")
+        self.cfg["basic"].setdefault("curriculum_window", 50)     # 最近 N 个 episode 统计成功率
+        self.cfg["basic"].setdefault("eval_every_episodes", 100)  # 每 N 个 episode 评估
+        self.cfg["basic"].setdefault("use_respawn_on_success", False)  # True=成功后不结束、刷远球继续追
+        self.cfg["basic"].setdefault("respawn_r_min", 2.0)
+        self.cfg["basic"].setdefault("respawn_r_max", 8.0)
         if not self.test:
             self.cfg["viewer"]["record_video"] = False
 
@@ -105,8 +108,8 @@ class Runner:
             action_dim = 3
             # 从 cfg 读高层命令的物理范围；提供安全缺省
             cmd_cfg = self.env.controller.cfg.get("commands", {})
-            vx_range = np.array([0.0, 0.5], dtype=np.float32)  # 允许只前进：min=0.0
-            vy_range = np.array([-0.3, 0.3], dtype=np.float32)
+            vx_range = np.array([0.0, 0.6], dtype=np.float32)  # 允许只前进：min=0.0
+            vy_range = np.array([-0.35, 0.35], dtype=np.float32)
             yaw_range = np.array([-1.0, 1.0], dtype=np.float32)
             act_low = np.array([vx_range[0], vy_range[0], yaw_range[0]], dtype=np.float32)
             act_high = np.array([vx_range[1], vy_range[1], yaw_range[1]], dtype=np.float32)
@@ -172,7 +175,7 @@ class Runner:
 
         self.evaluator = evaluator = ChaseBallEvaluator(
             max_steps=500, 
-            success_dist_thresh=0.5,
+            success_dist_thresh=0.6,
             tb_prefix="eval",
             save_dir = os.path.join("logs", "ckpt"),
             save_best_by = "success_rate",
@@ -184,6 +187,11 @@ class Runner:
         episode_return = 0
         max_steps = 500
         episode_idx = 0
+        CURR_N = int(self.cfg["basic"]["curriculum_window"])
+        succ_history = []  # 最近 N 个 episode 的 0/1
+        use_respawn = bool(self.cfg["basic"]["use_respawn_on_success"])
+        respawn_r_min = float(self.cfg["basic"]["respawn_r_min"])
+        respawn_r_max = float(self.cfg["basic"]["respawn_r_max"])
 
         try:
             while True:
@@ -197,7 +205,12 @@ class Runner:
                 q_max = q_mean = q_selected = None
                 if mode == "discrete" and hasattr(agent, "q_net"):
                     with torch.no_grad():
-                        q_vals = agent.q_net(torch.as_tensor(obs_high.squeeze(0).cpu().numpy(), dtype=torch.float32, device=self.device).unsqueeze(0))
+                        q_vals = agent.q_net(
+                            torch.as_tensor(
+                                obs_high.squeeze(0).cpu().numpy(), 
+                                dtype=torch.float32, 
+                                device=self.device
+                                ).unsqueeze(0))
                         q_max = float(q_vals.max().item())
                         q_mean = float(q_vals.mean().item())
                         q_selected = float(q_vals[0, int(action_repr)].item())
@@ -207,6 +220,9 @@ class Runner:
                 last_infos = infos
                 success_happened = False
                 fall_happened = False
+
+                tb.set_step(global_step)
+                tb.add_scalar("train/env_frames", global_step * ACTION_REPEAT)
 
                 for _ in range(ACTION_REPEAT):
                     with torch.no_grad():
@@ -223,17 +239,27 @@ class Runner:
                     acc_rew_high += step_rew_high
 
                     if isinstance(infos, dict) and infos.get("fall", False):
-                        fall_happened = True      
+                        fall_happened = True   
+                        tb.add_scalar("events/fallen", 1.0)  # 触发就写 1   
                         break
 
                     if isinstance(infos, dict) and infos.get("success", False):
                         success_happened = True     
-                        break
-                    
-
+                        tb.add_scalar("events/success", 1.0)  # 触发就写 1
+                        if use_respawn:
+                            try:
+                                self.env.respawn_ball_far(r_min=respawn_r_min, r_max=respawn_r_max)
+                            except Exception:
+                                pass
+                            # 连击模式下不 break，本高层步继续滚动（你也可以选择 break）
+                        else:
+                            break
                     if torch.any(done).item():
                         break
-
+                if not success_happened:
+                    tb.add_scalar("events/success", 0.0)
+                if not fall_happened:
+                    tb.add_scalar("events/fallen", 0.0)
                 # ---------- 高层一步的转移 ----------
                 next_obs_high = self.env.compute_high_level_obs().to(self.device)
                 next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
@@ -262,15 +288,6 @@ class Runner:
                     )
 
                 # ---------- TensorBoard ----------
-                tb.set_step(global_step)
-                env_frames = global_step * ACTION_REPEAT
-                tb.add_scalar("train/env_frames", env_frames)
-                tb.add_scalar("train/action_repeat", ACTION_REPEAT)
-                tb.add_scalar("train/replay_size", len(agent.replay_buffer))
-
-                dist_now_world = self.env.get_dist_xy(frame="world")
-                tb.add_scalar("train/dist_xy", dist_now_world)
-                # 按算法记录
                 if mode == "discrete":
                     tb.add_scalar("dqn/epsilon", getattr(agent, "epsilon", 0.0))
                     tb.add_scalar("dqn/update_steps", getattr(agent, "step_count", 0))
@@ -279,46 +296,48 @@ class Runner:
                     if q_mean is not None: tb.add_scalar("dqn/q_mean", q_mean)
                     if q_selected is not None: tb.add_scalar("dqn/q_selected", q_selected)
                 else:
-                    # SAC 可选：记录 alpha
                     if hasattr(agent, "log_alpha"):
                         tb.add_scalar("sac/alpha", float(agent.log_alpha.exp().item()))
                     tb.add_scalar("high/action_vx", float(action_cmd[0]))
                     tb.add_scalar("high/action_vy", float(action_cmd[1]))
                     tb.add_scalar("high/action_yaw", float(action_cmd[2]))
 
+                tb.add_scalar("train/replay_size", len(agent.replay_buffer))
                 tb.add_scalar("high/reward", rew_high)
-                tb.add_scalar("high/success", float(success_happened))
-                tb.add_scalar("high/fallen", float(fall_happened))
-                # 奖励分解项（来自 env.extras）
-                if isinstance(last_infos, dict):
-                    terms = last_infos.get("rew_terms", {})
-                    if isinstance(terms, dict):
-                        if "dist_xy" in terms:       tb.add_scalar("rew/dist_xy", float(terms["dist_xy"]))
-                        if "heading_cos" in terms:   tb.add_scalar("rew/heading_cos", float(terms["heading_cos"]))
-                        if "progress" in terms:      tb.add_scalar("rew/progress", float(terms["progress"]))
-                        if "progress_norm" in terms: tb.add_scalar("rew/progress_norm", float(terms["progress_norm"]))
-                        if "speed_toward" in terms:  tb.add_scalar("rew/speed_toward", float(terms["speed_toward"]))
-                        if "speed_orth" in terms:    tb.add_scalar("rew/speed_orth", float(terms["speed_orth"]))
-                        if "spin_penalty" in terms:  tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
 
                 global_step += 1
 
                 # ---------- 定期评估 ----------
-                if (episode_idx % 100 == 0) and (episode_idx != 0):
+                EVAL_EVERY = int(self.cfg["basic"]["eval_every_episodes"])
+                if (episode_idx % EVAL_EVERY == 0) and (episode_idx != 0):
                     metrics = self.evaluator.evaluate(
                         env=self.env, low_model=self.model, high_agent=agent,
                         device=self.device, episodes=5, tb=tb, global_step=global_step
                     )
                     print(f"[Eval @ episode {episode_idx} | step {global_step}] {metrics}")
-
                 # ---------- 回合结束 ----------
                 if done_high:
+                    succ = 1.0 if (success_happened and not fall_happened) else 0.0
                     tb.add_scalars("high/episode", {
                         "return": episode_return,
                         "length": episode_step,
-                        "success": float(success_happened),
+                        "success": succ,
+                        "init_dist": self.env.get_initial_dist_xy(),
                     })
-                    print(f"[Episode End] Return: {episode_return:.2f}, Step: {episode_step}, Success: {success_happened}")
+                    print(f"[Episode End] ep#{episode_idx} | Return: {episode_return:.2f} | "
+                          f"Step: {episode_step} | Success: {bool(succ)} | "
+                          f"InitDist: {self.env.get_initial_dist_xy():.2f}")
+
+                    # 课程统计
+                    succ_history.append(succ)
+                    if len(succ_history) > CURR_N:
+                        succ_history.pop(0)
+                    # 每个 episode 都可以用最近窗口调整一次课程窗口
+                    try:
+                        self.env.set_curriculum_window(succ_count=int(sum(succ_history)), epi_count=len(succ_history))
+                    except Exception:
+                        pass
+
                     episode_idx += 1
                     episode_step = 0
                     episode_return = 0.0
@@ -339,3 +358,7 @@ class Runner:
 
         finally:
             tb.close()
+    
+    if __name__ == "__main__":
+        runner = Runner(test=False)
+        runner.chaseBall()

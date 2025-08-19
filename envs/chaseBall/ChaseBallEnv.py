@@ -24,6 +24,12 @@ class ChaseBallEnv:
         self.num_actions = cfg["env"]["num_actions"]
         self.dt = cfg["control"]["decimation"] * cfg["sim"]["dt"]
 
+        self.cur_r_min = 1.0
+        self.cur_r_max = 1.5
+
+        self._milestones = [4.0,3.0,2.0,1.5,1.0]
+        self._milestones_passed = set()
+
         # core buffers
         self.obs_buf = torch.zeros(1, self.num_obs, dtype=torch.float, device=dev)
         self.rew_buf = torch.zeros(0, dtype=torch.float, device=dev)
@@ -33,6 +39,7 @@ class ChaseBallEnv:
         self.extras = {"rew_terms": {}}
 
         self._prev_dist_xy = None  # 用于计算进步奖励
+        self.initial_dist_xy = 0.0
 
         # get gym state tensors
         actor_root_state = self.controller.gym.acquire_actor_root_state_tensor(self.controller.sim)
@@ -91,7 +98,14 @@ class ChaseBallEnv:
                     found = True
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
-
+    
+    def set_curriculum_window(self, succ_count:int, epi_count:int):
+        epi_count = max(1, int(epi_count))
+        rate = float(succ_count) / float(epi_count)
+        if rate > 0.6:
+            self.cur_r_max = float(min(8.0, self.cur_r_max + 0.3))
+        elif rate < 0.3:
+            self.cur_r_max = float(max(1.2, self.cur_r_max - 0.2))
     def reset(self):
         obs, infos = self.controller.reset(
             self.default_dof_pos, self.dof_pos, self.dof_vel, self.dof_state, 
@@ -102,6 +116,8 @@ class ChaseBallEnv:
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
         self._prev_dist_xy = None  # 重置进步奖励计算
+        self._milestones_passed.clear()
+        self.initial_dist_xy = self.get_dist_xy()
         return obs, infos
 
     def pre_step(self, actions):
@@ -171,8 +187,8 @@ class ChaseBallEnv:
             self.time_out_buf[env_ids] = False
             # 进步奖励基线清空（下一回合第一步不做错误差分）
             self._prev_dist_xy = None
-            # 防止高层读到上回合的摔倒标志
-            self.extras["fall"] = False
+            self._milestones_passed.clear()
+            self.initial_dist_xy = self.get_dist_xy()
 
         self.controller._compute_observations(
             self.projected_gravity,self.base_ang_vel,self.commands,
@@ -229,10 +245,17 @@ class ChaseBallEnv:
             progress_norm = torch.clamp(raw / (prev_dist + 1e-6), -1.0, 1.0)
         self._prev_dist_xy = dist_xy.detach()
 
+        m_bonus = 0.0
+        for m in self._milestones:
+            if (m not in self._milestones_passed) and (dist_xy < m):
+                self._milestones_passed.add(m)
+                m_bonus += 1.0
+
         # --- 成功判定与奖励（加大力度） ---
-        success_thresh = 0.45
+        success_thresh = 0.60
         success = (dist_xy < success_thresh)
-        success_bonus = 20.0 if success else 0.0   # << 加大
+        init_d = torch.tensor(self.get_initial_dist_xy(), device=device)
+        success_bonus = (12.0 + 2.0 * torch.clamp(init_d, 0.0, 8.0)) if success else 0.0
 
         # --- 合成（权重可微调） ---
         # 侧滑惩罚、原地转圈惩罚都只扣非负值
@@ -246,6 +269,7 @@ class ChaseBallEnv:
         - 0.2 * torch.abs(speed_orth)  # 抑制侧滑
         - 0.2 * spin_penalty           # 抑制原地瞎转
         + success_bonus
+        + m_bonus
         - time_penalty
         - fallen_penalty              # 摔倒惩罚
         )
@@ -258,6 +282,7 @@ class ChaseBallEnv:
         self.extras["rew_terms"]["speed_toward"]  = speed_toward.detach()
         self.extras["rew_terms"]["speed_orth"]    = speed_orth.detach()
         self.extras["rew_terms"]["spin_penalty"]  = spin_penalty.detach()
+        self.extras["rew_terms"]["milestone_bonus"] = torch.tensor(m_bonus, device=device)
         self.extras["success"] = bool(success)
 
         return reward.view(1).to(device)
@@ -349,6 +374,9 @@ class ChaseBallEnv:
 
         return float(dist_xy.item())
         
+    def get_initial_dist_xy(self):
+        return float(self.initial_dist_xy)
+
     def step(self, actions):
         # locomotion原始step，保持不变
         dof_targets = self.pre_step(actions)
@@ -405,6 +433,51 @@ class ChaseBallEnv:
         large_tilt = tilt > tilt_threshold
 
         return low_z or large_tilt
+        
+    # ====== 球的随机与重刷（课程/连击用）======
+    def _reset_ball_positions(self, env_ids, root_states):
+        """
+        把球刷在“以机器人为圆心”的环形带内：r ∈ [cur_r_min, cur_r_max]，角度均匀
+        """
+        r_min = float(getattr(self, "cur_r_min", 0.6))
+        r_max = float(getattr(self, "cur_r_max", 1.5))
+        ball_z = 0.12
+
+        for _ in env_ids:
+            base_x = float(root_states[0, 0].item())
+            base_y = float(root_states[0, 1].item())
+
+            theta = np.random.uniform(-np.pi, np.pi)
+            r = np.random.uniform(r_min, r_max)
+            x = base_x + r * np.cos(theta)
+            y = base_y + r * np.sin(theta)
+
+            root_states[1, 0] = x
+            root_states[1, 1] = y
+            root_states[1, 2] = ball_z
+            root_states[1, 7:13] = 0.0
+
+        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(root_states))
+
+    def respawn_ball_far(self, r_min=2.0, r_max=8.0):
+        """
+        多目标连击：不结束回合，直接把球重刷到远处。
+        """
+        root_states = self.root_states
+        base_x = float(root_states[0, 0].item())
+        base_y = float(root_states[0, 1].item())
+        theta = np.random.uniform(-np.pi, np.pi)
+        r = np.random.uniform(r_min, r_max)
+        root_states[1, 0] = base_x + r * np.cos(theta)
+        root_states[1, 1] = base_y + r * np.sin(theta)
+        root_states[1, 2] = 0.12
+        root_states[1, 7:13] = 0.0
+        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(root_states))
+
+        # 回合中的“重置”局部状态
+        self._prev_dist_xy = None
+        self._milestones_passed.clear()
+        self.initial_dist_xy = self.get_dist_xy()
 
     def debug_print_positions(self):
         # 假设你只有一个env实例，env_id=0
