@@ -304,7 +304,24 @@ class Runner:
 
                 tb.add_scalar("train/replay_size", len(agent.replay_buffer))
                 tb.add_scalar("high/reward", rew_high)
-
+                
+                if isinstance(last_infos, dict):
+                    terms = last_infos.get("rew_terms", {})
+                    if isinstance(terms, dict):
+                        if "dist_xy" in terms:
+                            tb.add_scalar("rew/dist_xy", float(terms["dist_xy"]))
+                        if "heading_cos" in terms:
+                            tb.add_scalar("rew/heading_cos", float(terms["heading_cos"]))
+                        if "progress" in terms:
+                            tb.add_scalar("rew/progress", float(terms["progress"]))
+                        if "progress_norm" in terms:
+                            tb.add_scalar("rew/progress_norm", float(terms["progress_norm"]))
+                        if "speed_toward" in terms:
+                            tb.add_scalar("rew/speed_toward", float(terms["speed_toward"]))
+                        if "speed_orth" in terms:
+                            tb.add_scalar("rew/speed_orth", float(terms["speed_orth"]))
+                        if "spin_penalty" in terms:
+                            tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
                 global_step += 1
 
                 # ---------- 定期评估 ----------

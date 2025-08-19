@@ -189,7 +189,7 @@ class LowLevelController(BaseTask):
 
         self._reset_dofs(env_ids, default_dof_pos, dof_pos, dof_vel,dof_state)
         self._reset_root_states(env_ids, root_states_robot, root_states)
-        self._reset_ball_positions(env_ids, root_states)
+        #self._reset_ball_positions(env_ids, root_states)
         last_dof_targets[env_ids] = dof_pos[env_ids]
         last_root_vel[env_ids] = root_states_robot[env_ids, 7:13]
         episode_length_buf[env_ids] = 0

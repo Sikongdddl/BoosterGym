@@ -104,8 +104,11 @@ class ChaseBallEnv:
         rate = float(succ_count) / float(epi_count)
         if rate > 0.6:
             self.cur_r_max = float(min(8.0, self.cur_r_max + 0.3))
+            print("cur r max is: ", self.cur_r_max)
         elif rate < 0.3:
             self.cur_r_max = float(max(1.2, self.cur_r_max - 0.2))
+            print("cur r max is: ", self.cur_r_max)
+
     def reset(self):
         obs, infos = self.controller.reset(
             self.default_dof_pos, self.dof_pos, self.dof_vel, self.dof_state, 
@@ -115,6 +118,9 @@ class ChaseBallEnv:
             self.cmd_resample_time, self.delay_steps, self.time_out_buf,
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
+        
+        self._reset_ball_positions(torch.arange(1, device=self.controller.device), self.root_states)
+
         self._prev_dist_xy = None  # 重置进步奖励计算
         self._milestones_passed.clear()
         self.initial_dist_xy = self.get_dist_xy()
@@ -433,7 +439,7 @@ class ChaseBallEnv:
         large_tilt = tilt > tilt_threshold
 
         return low_z or large_tilt
-        
+
     # ====== 球的随机与重刷（课程/连击用）======
     def _reset_ball_positions(self, env_ids, root_states):
         """
