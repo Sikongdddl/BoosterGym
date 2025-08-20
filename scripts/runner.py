@@ -123,7 +123,7 @@ class Runner:
                 buffer_capacity=200000,
                 batch_size=256,
                 lr=3e-4,
-                gamma=0.99,
+                gamma=0.90,
                 tau=0.005,
                 alpha=None,  # 自动温度
             )
@@ -263,7 +263,7 @@ class Runner:
                 # ---------- 高层一步的转移 ----------
                 next_obs_high = self.env.compute_high_level_obs().to(self.device)
                 next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
-                rew_high = acc_rew_high if success_happened else (acc_rew_high / ACTION_REPEAT)
+                rew_high = acc_rew_high / ACTION_REPEAT
 
                 episode_step += 1
                 episode_return += rew_high
@@ -304,7 +304,7 @@ class Runner:
 
                 tb.add_scalar("train/replay_size", len(agent.replay_buffer))
                 tb.add_scalar("high/reward", rew_high)
-                
+
                 if isinstance(last_infos, dict):
                     terms = last_infos.get("rew_terms", {})
                     if isinstance(terms, dict):
@@ -312,10 +312,8 @@ class Runner:
                             tb.add_scalar("rew/dist_xy", float(terms["dist_xy"]))
                         if "heading_cos" in terms:
                             tb.add_scalar("rew/heading_cos", float(terms["heading_cos"]))
-                        if "progress" in terms:
-                            tb.add_scalar("rew/progress", float(terms["progress"]))
-                        if "progress_norm" in terms:
-                            tb.add_scalar("rew/progress_norm", float(terms["progress_norm"]))
+                        if "progress_gain" in terms:
+                            tb.add_scalar("rew/progress_gain", float(terms["progress_gain"]))
                         if "speed_toward" in terms:
                             tb.add_scalar("rew/speed_toward", float(terms["speed_toward"]))
                         if "speed_orth" in terms:
@@ -340,6 +338,7 @@ class Runner:
                         "length": episode_step,
                         "success": succ,
                         "init_dist": self.env.get_initial_dist_xy(),
+                        "cur_r_max": self.env.cur_r_max,
                     })
                     print(f"[Episode End] ep#{episode_idx} | Return: {episode_return:.2f} | "
                           f"Step: {episode_step} | Success: {bool(succ)} | "
@@ -350,10 +349,11 @@ class Runner:
                     if len(succ_history) > CURR_N:
                         succ_history.pop(0)
                     # 每个 episode 都可以用最近窗口调整一次课程窗口
-                    try:
-                        self.env.set_curriculum_window(succ_count=int(sum(succ_history)), epi_count=len(succ_history))
-                    except Exception:
-                        pass
+                    if episode_idx > 20 :
+                        try:
+                            self.env.set_curriculum_window(succ_count=int(sum(succ_history)), epi_count=len(succ_history))
+                        except Exception:
+                            pass
 
                     episode_idx += 1
                     episode_step = 0

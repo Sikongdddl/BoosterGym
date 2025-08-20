@@ -207,8 +207,7 @@ class ChaseBallEnv:
 
     def compute_high_level_reward(self):
         device = self.controller.device
-
-        # --- 位姿 ---
+        # --- 位姿/几何 ---
         robot_pos = self.base_pos[0, :3]
         ball_idx  = self.controller.num_bodies_robot
         ball_pos  = self.body_states[0, ball_idx, 0:3]
@@ -218,7 +217,7 @@ class ChaseBallEnv:
         dist_xy = torch.norm(delta_xy) + 1e-6
         to_ball_xy = delta_xy / dist_xy
 
-        # --- 机体前向（仅XY）---
+        # --- 前向与朝向 ---
         FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)
         fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)
         fwd_xy = fwd_world[:2]
@@ -228,70 +227,67 @@ class ChaseBallEnv:
 
         # --- 速度分解 ---
         v_xy = self.base_lin_vel[0, :2]
-        speed_toward = torch.dot(v_xy, to_ball_xy)     # 朝球速度(可正可负)
-        # 与球方向正交的单位向量
+        speed_toward = torch.dot(v_xy, to_ball_xy)           # 朝球速度(可正可负)
         to_ball_perp = torch.stack([-to_ball_xy[1], to_ball_xy[0]])
-        speed_orth = torch.dot(v_xy, to_ball_perp)     # 侧滑速度
-        speed_reward = torch.tanh(0.8 * speed_toward)  # 平滑压缩到 [-1,1]
+        speed_orth   = torch.dot(v_xy, to_ball_perp)         # 侧滑速度
+        speed_reward = torch.tanh(0.8 * speed_toward)        # [-1,1]
 
-        # --- 反转圈：朝向球速度很小但角速度很大，判定为原地转圈 ---
-        yaw_rate = self.base_ang_vel[0, 2]             # 机体z轴角速度
+        # --- 反转圈惩罚 ---
+        yaw_rate = self.base_ang_vel[0, 2]
         spinning = (torch.abs(speed_toward) < 0.02) * (torch.abs(yaw_rate) > 0.8)
         spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=device))
         spin_penalty = torch.clamp(spin_penalty, 0.0, 3.0)
 
-        # --- 进步奖励：标准化差分，尺度稳定 ---
+        # --- 进步奖励（放大近端斜率；只奖励正进步）---
         prev_dist = getattr(self, "_prev_dist_xy", None)
         if prev_dist is None:
-            progress = torch.tensor(0.0, device=device)
-            progress_norm = torch.tensor(0.0, device=device)
+            progress_raw = torch.tensor(0.0, device=device)
         else:
-            raw = (prev_dist - dist_xy)
-            progress = torch.clamp(raw, -1.0, 1.0)
-            progress_norm = torch.clamp(raw / (prev_dist + 1e-6), -1.0, 1.0)
+            progress_raw = torch.clamp(prev_dist - dist_xy, 0.0, 0.5)   # 只要正进步
+        # 距离越近，同样的 d 提供更大奖励（1/(dist+c) 放大）
+        progress_gain = progress_raw * (1.0 / (dist_xy + 0.5))
         self._prev_dist_xy = dist_xy.detach()
 
-        m_bonus = 0.0
-        for m in self._milestones:
-            if (m not in self._milestones_passed) and (dist_xy < m):
-                self._milestones_passed.add(m)
-                m_bonus += 1.0
+        # --- 门控后的朝向项：只有在“确实向前”才给朝向分 ---
+        moving = (speed_toward > 0.03).float()
+        heading_term = moving * heading_reward  # 静止/后退不拿朝向分
 
-        # --- 成功判定与奖励（加大力度） ---
         success_thresh = 0.60
+        # --- 成功与一次性奖励（要求“在动”）---
         success = (dist_xy < success_thresh)
         init_d = torch.tensor(self.get_initial_dist_xy(), device=device)
-        success_bonus = (12.0 + 2.0 * torch.clamp(init_d, 0.0, 8.0)) if success else 0.0
+        success_bonus = 3.0 if (success and speed_toward > 0.05) else 0.0
 
-        # --- 合成（权重可微调） ---
-        # 侧滑惩罚、原地转圈惩罚都只扣非负值
-        time_penalty = 0.001
-        # 摔倒惩罚
+        # --- 每步时间惩罚（稍微加大；建议与步长相称）---
+        time_penalty = 0.01  # 原来是 0.001，太轻了；可按仿真步长微调
+
+        # --- 摔倒惩罚 ---
         fallen_penalty = 10.0 if self.extras.get("fall", False) else 0.0
+
+        # --- 合成 ---
         reward = (
-            1.0 * progress_norm          # 稳定尺度的进步
-        + 0.3 * heading_reward         # 对准
-        + 0.7 * speed_reward           # 朝球移动
-        - 0.2 * torch.abs(speed_orth)  # 抑制侧滑
-        - 0.2 * spin_penalty           # 抑制原地瞎转
-        + success_bonus
-        + m_bonus
-        - time_penalty
-        - fallen_penalty              # 摔倒惩罚
+            1.2 * progress_gain            # 强化“靠近就加分”，且越近增益越大
+            + 0.6 * speed_reward             # 真正向前的速度分
+            + 0.2 * heading_term             # 只在前进时给的朝向分（降权+门控）
+            - 0.2 * torch.abs(speed_orth)    # 侧滑抑制
+            - 0.2 * spin_penalty             # 转圈抑制
+            + success_bonus                  # 成功一次性奖励
+            - time_penalty                   # 时间成本
+            - fallen_penalty                 # 摔倒成本
         )
 
-        # logging
-        self.extras["rew_terms"]["heading_cos"]   = heading_cos.detach()
-        self.extras["rew_terms"]["dist_xy"]       = dist_xy.detach()
-        self.extras["rew_terms"]["progress"]      = progress.detach()
-        self.extras["rew_terms"]["progress_norm"] = progress_norm.detach()
-        self.extras["rew_terms"]["speed_toward"]  = speed_toward.detach()
-        self.extras["rew_terms"]["speed_orth"]    = speed_orth.detach()
-        self.extras["rew_terms"]["spin_penalty"]  = spin_penalty.detach()
-        self.extras["rew_terms"]["milestone_bonus"] = torch.tensor(m_bonus, device=device)
+        # logging（新增若干项，便于用 TensorBoard 观察）
+        self.extras["rew_terms"]["heading_cos"]     = heading_cos.detach()
+        self.extras["rew_terms"]["heading_term"]    = heading_term.detach()
+        self.extras["rew_terms"]["dist_xy"]         = dist_xy.detach()
+        self.extras["rew_terms"]["progress_gain"]   = progress_gain.detach()
+        self.extras["rew_terms"]["speed_toward"]    = speed_toward.detach()
+        self.extras["rew_terms"]["speed_orth"]      = speed_orth.detach()
+        self.extras["rew_terms"]["spin_penalty"]    = spin_penalty.detach()
         self.extras["success"] = bool(success)
 
         return reward.view(1).to(device)
+
 
     def apply_high_level_command(self, cmd, smooth=None):
         """
