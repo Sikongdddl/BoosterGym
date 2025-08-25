@@ -1,6 +1,6 @@
 basic:
   checkpoint: null # set to -1 to load last saved model
-  headless: true
+  headless: false
   max_iterations: 10000 # set the maximum number of learning iterations to train for
   sim_device: "cuda:0" # device for physics simulation
   rl_device: "cuda:0" # device for the RL algorithm
@@ -108,8 +108,6 @@ commands:
   ang_vel_yaw: [-1, 1]   # min max [rad/s]
   resampling_time_s: [8., 12.]
   gait_frequency: [1.0, 2.0] # min max [Hz]
-  # curriculum only:
-  curriculum: false
   update_rate: 0.1
   lin_vel_levels: 10
   ang_vel_levels: 10
@@ -277,3 +275,13 @@ rewards:
   soft_torque_limit: 1.
   swing_period: 0.2
   feet_distance_ref: 0.2
+
+curriculum:
+  r_min: 1.0
+  r_max: 1.5
+  inc: 0.3
+  dec: 0.2
+  r_max_cap: 8.0
+  r_max_floor: 1.2
+  high_thresh: 0.6
+  low_thresh: 0.3

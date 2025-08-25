@@ -8,18 +8,13 @@ from isaacgym.torch_utils import (
     quat_rotate,
 )
 
-from envs.components.LowLevelController import LowLevelController
-from envs.components.ballWorld import BallWorld
-from envs.components.curriculum import CurriculumPolicy
+from envs.chaseBall.LowLevelController import LowLevelController
 
 class ChaseBallEnv:
     def __init__(self, cfg):
         self.controller = LowLevelController(cfg)
         self._init_buffers()
-        self.ball_world = BallWorld(self.controller, default_z = 0.12)
-        self.curriculum = CurriculumPolicy.from_dict(self.controller.cfg.get("curriculum"))
-        self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
-
+    
     def _init_buffers(self):
         cfg = self.controller.cfg
         dev = self.controller.device
@@ -107,10 +102,12 @@ class ChaseBallEnv:
     def set_curriculum_window(self, succ_count:int, epi_count:int):
         epi_count = max(1, int(epi_count))
         rate = float(succ_count) / float(epi_count)
-        r_min, r_max = self.curriculum.update_by_success_rate(rate)  # 更新策略内部状态
-        # 同步老字段，方便日志/其它代码直接读
-        self.cur_r_min, self.cur_r_max = r_min, r_max
-        print("cur r max is: ", self.cur_r_max)
+        if rate > 0.6:
+            self.cur_r_max = float(min(8.0, self.cur_r_max + 0.3))
+            print("cur r max is: ", self.cur_r_max)
+        elif rate < 0.3:
+            self.cur_r_max = float(max(1.2, self.cur_r_max - 0.2))
+            print("cur r max is: ", self.cur_r_max)
 
     def reset(self):
         obs, infos = self.controller.reset(
@@ -122,10 +119,8 @@ class ChaseBallEnv:
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
         
-        self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
-        base_xy = (float(self.root_states[0, 0].item()), float(self.root_states[0, 1].item()))
-        self.ball_world.reset_ring(self.root_states, r_min=self.cur_r_min, r_max=self.cur_r_max, base_xy=base_xy)
-        
+        self._reset_ball_positions(torch.arange(1, device=self.controller.device), self.root_states)
+
         self._prev_dist_xy = None  # 重置进步奖励计算
         self._milestones_passed.clear()
         self.initial_dist_xy = self.get_dist_xy()
@@ -440,6 +435,51 @@ class ChaseBallEnv:
         large_tilt = tilt > tilt_threshold
 
         return low_z or large_tilt
+
+    # ====== 球的随机与重刷（课程/连击用）======
+    def _reset_ball_positions(self, env_ids, root_states):
+        """
+        把球刷在“以机器人为圆心”的环形带内：r ∈ [cur_r_min, cur_r_max]，角度均匀
+        """
+        r_min = float(getattr(self, "cur_r_min", 0.6))
+        r_max = float(getattr(self, "cur_r_max", 1.5))
+        ball_z = 0.12
+
+        for _ in env_ids:
+            base_x = float(root_states[0, 0].item())
+            base_y = float(root_states[0, 1].item())
+
+            theta = np.random.uniform(-np.pi, np.pi)
+            r = np.random.uniform(r_min, r_max)
+            x = base_x + r * np.cos(theta)
+            y = base_y + r * np.sin(theta)
+
+            root_states[1, 0] = x
+            root_states[1, 1] = y
+            root_states[1, 2] = ball_z
+            root_states[1, 7:13] = 0.0
+
+        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(root_states))
+
+    def respawn_ball_far(self, r_min=2.0, r_max=8.0):
+        """
+        多目标连击：不结束回合，直接把球重刷到远处。
+        """
+        root_states = self.root_states
+        base_x = float(root_states[0, 0].item())
+        base_y = float(root_states[0, 1].item())
+        theta = np.random.uniform(-np.pi, np.pi)
+        r = np.random.uniform(r_min, r_max)
+        root_states[1, 0] = base_x + r * np.cos(theta)
+        root_states[1, 1] = base_y + r * np.sin(theta)
+        root_states[1, 2] = 0.12
+        root_states[1, 7:13] = 0.0
+        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(root_states))
+
+        # 回合中的“重置”局部状态
+        self._prev_dist_xy = None
+        self._milestones_passed.clear()
+        self.initial_dist_xy = self.get_dist_xy()
 
     def debug_print_positions(self):
         # 假设你只有一个env实例，env_id=0
