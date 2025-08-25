@@ -5,10 +5,10 @@ basic:
   sim_device: "cuda:0" # device for physics simulation
   rl_device: "cuda:0" # device for the RL algorithm
   seed: 42 # seed - set to -1 to choose random seed
+  algo: "dqn" # high-level RL algorithm: dqn or sac
   description: ""
 
 env:
-  num_envs: 4096
   num_observations: 47
   num_privileged_obs: 14
   num_actions: 12
@@ -23,7 +23,7 @@ runner:
 viewer:
   pos: [3., -3., 2.]  # [m]
   lookat: [0., 0., 0.]  # [m]
-  record_video: true  # only in play
+  record_video: false  # only in play
   record_interval: 5.  # [s]
   record_env_idx: 0
 
@@ -57,9 +57,9 @@ sim:
     contact_collection: 1 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (broken - do not use!)
 
 asset:
-  file: "resources/T1/T1_locomotion.urdf"
-  mujoco_file: "resources/T1/T1_locomotion.xml"
-  name: "T1"
+  file: "./resources/T1/T1_locomotion.urdf"
+  mujoco_file: "./resources/T1/T1_locomotion.xml"
+  name: "play_field"
   base_name: "Trunk"
   foot_names: ["left_foot_link", "right_foot_link"]
   disable_gravity: false
@@ -69,7 +69,7 @@ asset:
   self_collisions: 0 # 1 to disable, 0 to enable...bitwise filter
   replace_cylinder_with_capsule: false # replace collision cylinders with capsules, leads to faster/more stable simulation
   flip_visual_attachments: false # Some .obj meshes must be flipped from y-up to z-up
-  density: 0.001
+  density: 10 # which mean nothing because of fix-numbers in rigid mass
   angular_damping: 0.
   linear_damping: 0.
   max_angular_velocity: 1000.
@@ -95,22 +95,10 @@ control:
   decimation: 10
 
 terrain:
-  type: "trimesh" # "plane" or "trimesh"
+  type: "plane" # "plane" or "trimesh"
   static_friction: 1.0  # [-]
   dynamic_friction: 1.0  # [-]
   restitution: 0.        # [-]
-  # trimesh only:
-  terrain_length: 10.
-  terrain_width: 10.
-  border_size: 5.
-  num_terrains: 8
-  terrain_proportions: [0.0, 0.0, 0.5, 0.5] # terrain types: [plane, slope, random, discrete]
-  slope: 0.1
-  random_height: 0.1
-  discrete_height: 0.02
-  horizontal_scale: 0.1
-  vertical_scale: 0.005
-  slope_threshold: 2.0
 
 commands:
   num_commands: 3 # default: lin_vel_x, lin_vel_y, ang_vel_yaw

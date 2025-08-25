@@ -189,7 +189,7 @@ class LowLevelController(BaseTask):
 
         self._reset_dofs(env_ids, default_dof_pos, dof_pos, dof_vel,dof_state)
         self._reset_root_states(env_ids, root_states_robot, root_states)
-        self._reset_ball_positions(env_ids, root_states)
+        #self._reset_ball_positions(env_ids, root_states)
         last_dof_targets[env_ids] = dof_pos[env_ids]
         last_root_vel[env_ids] = root_states_robot[env_ids, 7:13]
         episode_length_buf[env_ids] = 0
@@ -224,25 +224,38 @@ class LowLevelController(BaseTask):
 
     def _reset_ball_positions(self, env_ids, root_states):
         """
-        重置球的位置到初始点或随机点。
+        把球刷在“以机器人为圆心”的环形带内：
+        r ∈ [r_min, r_max], 角度均匀
+        这样既不会一上来就成功，也不会远得离谱。
         """
-        # 获取球的初始高度和xy范围
-        ball_z = 0.12  # 球半径+地面偏移，可根据实际场地调整
-        ball_x_range = [0.5, 2.0]  # 可自定义
-        ball_y_range = [-1.0, 1.0]
-        # 获取root_states（所有刚体，包括球）
-        # 球的索引是 self.num_bodies_robot
-        for eid in env_ids:
-            x = np.random.uniform(ball_x_range[0], ball_x_range[1])
-            y = np.random.uniform(ball_y_range[0], ball_y_range[1])
-            # 只改球的xyz位置 idx0 is robot， idx1 is ball
+        # ---- 可调参数（可挪到 cfg["reset"] 里）----
+        r_min = 1.5     # 先易后难：成功阈值(≈0.45)外留点余量
+        r_max = 1.5
+        ball_z = 0.12   # 球半径 + 地面偏移
+
+        # 单环境：root_states[0] 约是机器人，root_states[1] 约是球
+        # 如果后续做多环境，需要改成按 env_ids/actor 索引批量写
+        for _ in env_ids:
+            # 机器人当前世界坐标（用 root_states[0,0:3]）
+            base_x = float(root_states[0, 0].item())
+            base_y = float(root_states[0, 1].item())
+
+            # 环形随机
+            theta = np.random.uniform(-np.pi / 2, np.pi / 2)
+            r = np.random.uniform(r_min, r_max)
+            x = base_x + r * np.cos(theta)
+            y = base_y + r * np.sin(theta)
+
+            # 写球位姿
             root_states[1, 0] = x
             root_states[1, 1] = y
             root_states[1, 2] = ball_z
-            # 球速度清零
+            # 清零球速度（线/角速度在 7:13）
             root_states[1, 7:13] = 0.0
+
         # 写回仿真
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
+
 
     def _compute_observations(self,
         projected_gravity,base_ang_vel,commands,

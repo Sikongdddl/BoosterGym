@@ -4,8 +4,12 @@ import numpy as np
 import torch
 
 class ChaseBallEvaluator(RLEvaluator):
-    def __init__(self, max_steps: int = 200, success_dist_thresh: float = 0.4, tb_prefix: str = "eval"):
-        super().__init__(max_steps=max_steps, tb_prefix=tb_prefix)
+    def __init__(self,
+        max_steps: int = 200, 
+        success_dist_thresh: float = 0.4, 
+        tb_prefix: str = "eval",
+        **kwargs):
+        super().__init__(max_steps=max_steps, tb_prefix=tb_prefix, **kwargs)
         self.success_dist_thresh = float(success_dist_thresh)
 
     def compute_step_metrics(self, env, infos) -> Dict[str, float]:
