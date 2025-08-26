@@ -21,6 +21,7 @@ class LowLevelController(BaseTask):
         self.gym.prepare_sim(self.sim)
 
     def _create_envs(self):
+        # 1. robot asset and ball asset
         booster_asset_cfg = self.cfg["asset"]
         booster_asset_root = os.path.dirname(booster_asset_cfg["file"])
         booster_asset_file = os.path.basename(booster_asset_cfg["file"])
@@ -44,13 +45,11 @@ class LowLevelController(BaseTask):
         
         ball_radius = 0.11
         ball_asset_options = gymapi.AssetOptions()
-        ball_asset_options.density = 80
+        ball_asset_options.density = 80.0
         ball_asset_options.disable_gravity = False
         ball_asset_options.fix_base_link = False
-        ball_asset_options.linear_damping = 0.015
-        ball_asset_options.angular_damping = 0.01
-        ball_asset_options.max_angular_velocity = 100.0
-
+        ball_asset_options.linear_damping = 0.5
+        ball_asset_options.angular_damping = 0.10
         ball_asset = self.gym.create_sphere(self.sim, ball_radius, ball_asset_options)
 
         # === 2. DOF/Body info        
@@ -117,9 +116,24 @@ class LowLevelController(BaseTask):
         ball_pose.p = gymapi.Vec3(1,0.0,ball_radius + 0.01)
         self.ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "SoccerBall",0,0)
         self.addtional_rigid_num += 1
-        # print(f"Total number of rigid bodies: {self.num_bodies_robot}")
-        # print(f"Total number of rigid bodies after ball creation: {self.num_bodies_robot + self.addtional_rigid_num}")
-
+        
+        # 8.1 set ball friction
+        ball_shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, self.ball_handle)
+        for sp in ball_shape_props:
+            sp.friction = 0.95            # 接触摩擦（滚动更“粘”）
+            # 下面两项在 rc4 存在，控制滚动/扭转能量损失；越大越快停
+            if hasattr(sp, "rolling_friction"):
+                sp.rolling_friction = 0.10
+            if hasattr(sp, "torsion_friction"):
+                sp.torsion_friction = 0.05
+            # 不改 sp.restitution
+        self.gym.set_actor_rigid_shape_properties(env_handle, self.ball_handle, ball_shape_props)
+        
+        print("ball friction/rolling/torsion:",
+          [getattr(s, "friction", None) for s in ball_shape_props],
+          [getattr(s, "rolling_friction", None) for s in ball_shape_props],
+          [getattr(s, "torsion_friction", None) for s in ball_shape_props])
+       
         # 9 add other assets
         self.addtional_rigid_num += create_strip_grass(self,env_handle,length=40.0,width=25.0,num_strips=15)
         self.addtional_rigid_num += create_field_boundary_lines(self,env_handle,length=40.0,width=25.0,line_width=0.15)
@@ -142,6 +156,7 @@ class LowLevelController(BaseTask):
             body_props[j].invMass = 1.0 / body_props[j].mass
 
         self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+        
         # cancel random foot props initialization
         shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, actor_handle)
         for idx in self.foot_shape_indices:
@@ -243,4 +258,3 @@ class LowLevelController(BaseTask):
             ),
             dim=-1,
         )
-
