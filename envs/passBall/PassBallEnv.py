@@ -10,16 +10,13 @@ from isaacgym.torch_utils import (
 
 from envs.components.LowLevelController import LowLevelController
 from envs.components.ballWorld import BallWorld
-from envs.components.curriculum import CurriculumPolicy
 
-class ChaseBallEnv:
+class PassBallEnv:
     def __init__(self, cfg):
         self.controller = LowLevelController(cfg)
         self._init_buffers()
         self.ball_world = BallWorld(self.controller, default_z = 0.12)
-        self.curriculum = CurriculumPolicy.from_dict(self.controller.cfg.get("curriculum"))
-        self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
-
+    
     def _init_buffers(self):
         cfg = self.controller.cfg
         dev = self.controller.device
@@ -104,14 +101,6 @@ class ChaseBallEnv:
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
     
-    def set_curriculum_window(self, succ_count:int, epi_count:int):
-        epi_count = max(1, int(epi_count))
-        rate = float(succ_count) / float(epi_count)
-        r_min, r_max = self.curriculum.update_by_success_rate(rate)  # 更新策略内部状态
-        # 同步老字段，方便日志/其它代码直接读
-        self.cur_r_min, self.cur_r_max = r_min, r_max
-        print("cur r max is: ", self.cur_r_max)
-
     def reset(self):
         obs, infos = self.controller.reset(
             self.default_dof_pos, self.dof_pos, self.dof_vel, self.dof_state, 
@@ -122,10 +111,16 @@ class ChaseBallEnv:
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
         
-        self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
-        base_xy = (float(self.root_states[0, 0].item()), float(self.root_states[0, 1].item()))
-        self.ball_world.reset_ring(self.root_states, r_min=self.cur_r_min, r_max=self.cur_r_max, base_xy=base_xy)
-        
+        self.ball_world.reset_at_feet(
+            root_states=self.root_states,
+            base_pos=self.base_pos,
+            base_quat=self.base_quat,
+            forward_dist=0.30,      # 约= 球半径0.11 + 6~7cm 缓冲，可按实际踢球距离微调
+            lateral_offset=0.0,     # 如果想让球偏左/偏右一点，可设成 ±0.05
+            z=None,                 # 默认用 self.default_z
+            zero_velocity=True
+        )
+
         self._prev_dist_xy = None  # 重置进步奖励计算
         self._milestones_passed.clear()
         self.initial_dist_xy = self.get_dist_xy()
@@ -211,87 +206,143 @@ class ChaseBallEnv:
         self.last_root_vel[:] = self.root_states_robot[:, 7:13]
 
     def compute_high_level_reward(self):
-        device = self.controller.device
-        # --- 位姿/几何 ---
+        """
+        PassBall 奖励：让球尽快、稳定地到达目标点。
+        需要用到：
+        - self.pass_target_xy: torch.tensor([tx, ty], device)  目标点(平面)
+            若未设置则默认用“机器人前方 +3m”。
+        - 缓存变量：
+            self._prev_ball2goal: 上一步球到目标的距离（用于进步项）
+            self._kicked_once: 是否已经完成一次“有效出脚”（接触 + 朝目标方向正速度）
+        """
+        dev = self.controller.device
+
+        # --- 目标点（默认：机体当前朝向前方 3m 处） ---
+        if not hasattr(self, "pass_target_xy") or self.pass_target_xy is None:
+            # 根据机器人朝向确定世界系前向方向
+            fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1.,0.,0.]], device=dev)).squeeze(0)
+            fwd_xy = fwd_world[:2]
+            fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
+            base_xy = self.base_pos[0, :2]
+            self.pass_target_xy = (base_xy + 3.0 * fwd_xy).detach()  # 前方 3 米
+
+        tx, ty = float(self.pass_target_xy[0]), float(self.pass_target_xy[1])
+        target_xy = torch.tensor([tx, ty], device=dev)
+
+        # --- 取关键量（世界系）---
         robot_pos = self.base_pos[0, :3]
         ball_idx  = self.controller.num_bodies_robot
         ball_pos  = self.body_states[0, ball_idx, 0:3]
+        ball_vel  = self.body_states[0, ball_idx, 7:10]    # 线速度
 
-        delta = ball_pos - robot_pos
-        delta_xy = delta[:2]
-        dist_xy = torch.norm(delta_xy) + 1e-6
-        to_ball_xy = delta_xy / dist_xy
+        robot_xy = robot_pos[:2]
+        ball_xy  = ball_pos[:2]
+        v_xy     = self.base_lin_vel[0, :2]                # 机体系速度（post_step 已旋到机体系），但这里只做标量大小不影响方向项
+        ball_vxy = ball_vel[:2]                            # 世界系球速
 
-        # --- 前向与朝向 ---
-        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)
-        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)
+        # 向量
+        to_ball_xy   = (ball_xy - robot_xy)
+        to_ball_d    = torch.norm(to_ball_xy) + 1e-6
+        to_ball_dir  = to_ball_xy / to_ball_d
+
+        ball_to_goal = (target_xy - ball_xy)
+        btg_d        = torch.norm(ball_to_goal) + 1e-6
+        btg_dir      = ball_to_goal / btg_d
+
+        # 机器人朝向（世界系）
+        fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1.,0.,0.]], device=dev)).squeeze(0)
         fwd_xy = fwd_world[:2]
         fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
-        heading_cos = torch.clamp(torch.dot(fwd_xy, to_ball_xy), -1.0, 1.0)
-        heading_reward = 0.5 * (heading_cos + 1.0)  # [0,1]
 
-        # --- 速度分解 ---
-        v_xy = self.base_lin_vel[0, :2]
-        speed_toward = torch.dot(v_xy, to_ball_xy)           # 朝球速度(可正可负)
-        to_ball_perp = torch.stack([-to_ball_xy[1], to_ball_xy[0]])
-        speed_orth   = torch.dot(v_xy, to_ball_perp)         # 侧滑速度
-        speed_reward = torch.tanh(0.8 * speed_toward)        # [-1,1]
+        # --- 关键指标 ---
+        # 1) 目标进步：球->目标距离的减少（只奖正进步），并在近端放大
+        prev = getattr(self, "_prev_ball2goal", None)
+        if prev is None:
+            progress_raw = torch.tensor(0.0, device=dev)
+        else:
+            progress_raw = torch.clamp(prev - btg_d, 0.0, 0.5)
+        progress_gain = progress_raw * (1.0 / (0.5 + btg_d))  # 越近增益越大
+        self._prev_ball2goal = btg_d.detach()
 
-        # --- 反转圈惩罚 ---
-        yaw_rate = self.base_ang_vel[0, 2]
-        spinning = (torch.abs(speed_toward) < 0.02) * (torch.abs(yaw_rate) > 0.8)
-        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=device))
+        # 2) 球的速度朝向目标的分量（希望球“真的往目标滚/飞”）
+        ball_speed_toward_goal = torch.dot(ball_vxy, btg_dir)     # 可正可负
+        ball_speed_term = torch.tanh(0.7 * ball_speed_toward_goal)
+
+        # 3) “对准-出脚”几何关系：
+        #    (a) 机器人->球 与 球->目标 大致共线（球在车前，且踢出去的直线对准目标）
+        align_rb_bg = torch.dot(to_ball_dir, btg_dir)             # [-1,1]
+        align_term  = 0.5 * (align_rb_bg + 1.0)                   # [0,1]
+
+        #    (b) 机器人前向与 球->目标 方向一致性（踢的方向不会歪）
+        heading_goal_cos = torch.dot(fwd_xy, btg_dir)             # [-1,1]
+        heading_goal_term = 0.5 * (heading_goal_cos + 1.0)        # [0,1]
+
+        # 4) 近身接触意图：鼓励“接近球 + 有前向速度”，以形成踢球
+        approach_speed = torch.dot(v_xy, to_ball_dir)              # 机体朝球方向的速度
+        approach_term  = torch.tanh(0.8 * approach_speed)          # [-1,1]
+
+        # --- 一次性“踢出”事件判定（用于大额 bonus，只判一次）---
+        if not hasattr(self, "_kicked_once"):
+            self._kicked_once = False
+        kicked_now = (to_ball_d < 0.25) and (approach_speed > 0.10) and (align_rb_bg > 0.6)
+        kick_bonus = 0.0
+        if (not self._kicked_once) and kicked_now:
+            self._kicked_once = True
+            kick_bonus = 2.0  # 你可以调 1~3 之间；只触发一次
+
+        # --- 成功条件：球到达目标并基本停住（或进圈/越线）---
+        success_radius = 0.35   # 目标附近的判定半径
+        settle_speed   = 0.20   # 认为“基本停住/到点”的速度阈值（m/s）
+        success = (btg_d < success_radius) and (torch.norm(ball_vxy) < settle_speed)
+        success_bonus = 6.0 if success else 0.0
+
+        # 若球已经被踢出且离球越来越远，可轻微奖励“与球拉开”（防止一直顶着）
+        sep_term = 0.0
+        if self._kicked_once:
+            sep_term = torch.clamp(to_ball_d - 0.50, min=0.0, max=1.0)  # 距离>0.5m 后给一点点分
+
+        # --- 约束/惩罚 ---
+        # 侧滑抑制（保持动作“干净”）；旋转抑制（防原地转圈）；时间成本
+        to_ball_perp = torch.stack([-to_ball_dir[1], to_ball_dir[0]])
+        speed_orth   = torch.dot(v_xy, to_ball_perp)
+        yaw_rate     = self.base_ang_vel[0, 2]
+        spinning     = (torch.abs(approach_speed) < 0.02) * (torch.abs(yaw_rate) > 0.8)
+        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=dev))
         spin_penalty = torch.clamp(spin_penalty, 0.0, 3.0)
 
-        # --- 进步奖励（放大近端斜率；只奖励正进步）---
-        prev_dist = getattr(self, "_prev_dist_xy", None)
-        if prev_dist is None:
-            progress_raw = torch.tensor(0.0, device=device)
-        else:
-            progress_raw = torch.clamp(prev_dist - dist_xy, 0.0, 0.5)   # 只要正进步
-        # 距离越近，同样的 d 提供更大奖励（1/(dist+c) 放大）
-        progress_gain = progress_raw * (1.0 / (dist_xy + 0.5))
-        self._prev_dist_xy = dist_xy.detach()
-
-        # --- 门控后的朝向项：只有在“确实向前”才给朝向分 ---
-        moving = (speed_toward > 0.03).float()
-        heading_term = moving * heading_reward  # 静止/后退不拿朝向分
-
-        success_thresh = 0.60
-        # --- 成功与一次性奖励（要求“在动”）---
-        success = (dist_xy < success_thresh)
-        init_d = torch.tensor(self.get_initial_dist_xy(), device=device)
-        success_bonus = 3.0 if (success and speed_toward > 0.05) else 0.0
-
-        # --- 每步时间惩罚（稍微加大；建议与步长相称）---
-        time_penalty = 0.01  # 原来是 0.001，太轻了；可按仿真步长微调
-
-        # --- 摔倒惩罚 ---
+        time_penalty   = 0.01
         fallen_penalty = 10.0 if self.extras.get("fall", False) else 0.0
 
         # --- 合成 ---
         reward = (
-            1.2 * progress_gain            # 强化“靠近就加分”，且越近增益越大
-            + 0.6 * speed_reward             # 真正向前的速度分
-            + 0.2 * heading_term             # 只在前进时给的朝向分（降权+门控）
-            - 0.2 * torch.abs(speed_orth)    # 侧滑抑制
-            - 0.2 * spin_penalty             # 转圈抑制
-            + success_bonus                  # 成功一次性奖励
-            - time_penalty                   # 时间成本
-            - fallen_penalty                 # 摔倒成本
+            1.5 * progress_gain           # 球到目标的“距离进步”是最核心的驱动
+            + 0.8 * ball_speed_term       # 球速度朝目标
+            + 0.5 * align_term            # 机器人-球-目标三点共线
+            + 0.3 * heading_goal_term     # 机器人朝向与目标方向一致
+            + 0.3 * approach_term         # 接近球并准备出脚
+            + 0.2 * sep_term              # 踢出后与球适度拉开
+            + kick_bonus                  # 一次性“踢出”事件奖励
+            + success_bonus               # 成功奖励
+            - 0.2 * torch.abs(speed_orth) # 侧滑抑制
+            - 0.2 * spin_penalty          # 转圈抑制
+            - time_penalty                # 时间成本
+            - fallen_penalty              # 摔倒成本
         )
 
-        # logging（新增若干项，便于用 TensorBoard 观察）
-        self.extras["rew_terms"]["heading_cos"]     = heading_cos.detach()
-        self.extras["rew_terms"]["heading_term"]    = heading_term.detach()
-        self.extras["rew_terms"]["dist_xy"]         = dist_xy.detach()
+        # --- 日志 ---
+        self.extras["rew_terms"]["btg_dist"]        = btg_d.detach()
         self.extras["rew_terms"]["progress_gain"]   = progress_gain.detach()
-        self.extras["rew_terms"]["speed_toward"]    = speed_toward.detach()
+        self.extras["rew_terms"]["ball_speed_tg"]   = ball_speed_toward_goal.detach()
+        self.extras["rew_terms"]["align_rb_bg"]     = align_rb_bg.detach()
+        self.extras["rew_terms"]["heading_goal"]    = heading_goal_cos.detach()
+        self.extras["rew_terms"]["approach_speed"]  = approach_speed.detach()
         self.extras["rew_terms"]["speed_orth"]      = speed_orth.detach()
         self.extras["rew_terms"]["spin_penalty"]    = spin_penalty.detach()
+        self.extras["rew_terms"]["kicked_once"]     = float(self._kicked_once)
         self.extras["success"] = bool(success)
 
-        return reward.view(1).to(device)
+        return reward.view(1).to(dev)
+
 
 
     def apply_high_level_command(self, cmd, smooth=None):

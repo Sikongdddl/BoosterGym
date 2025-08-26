@@ -44,7 +44,7 @@ class Runner:
 
     # Override config file with args if needed
     def _update_cfg_from_args(self):
-        cfg_file = os.path.join("envs", "chaseBall",f"{self.args.task}.yaml")
+        cfg_file = os.path.join("envs", "passBall",f"{self.args.task}.yaml")
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
 
@@ -153,7 +153,7 @@ class Runner:
             self.env.apply_high_level_command(cmd, smooth=0.5)
             return ("continuous", a_cont, cmd)
 
-    def chaseBall(self):
+    def passBall(self):
         # tensorboard logger
         run_name = f"{self.cfg['basic']['task']}_{time.strftime('%Y%m%d-%H%M%S')}"
         tb = TBLogger(
