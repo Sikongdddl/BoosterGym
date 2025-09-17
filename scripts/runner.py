@@ -34,7 +34,7 @@ class Runner:
     def _get_args(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
-        parser.add_argument("--algo", type=str, choices=["dqn", "sac"], default="dqn", help="High-level RL algorithm: dqn or sac.")
+        parser.add_argument("--algo", type=str, choices=["dqn", "sac"], default="sac", help="High-level RL algorithm: dqn or sac.")
         parser.add_argument("--checkpoint", type=str, help="Path of the model checkpoint to load. Overrides config file if provided.")
         parser.add_argument("--headless", type=bool, help="Run headless without creating a viewer window. Overrides config file if provided.")
         parser.add_argument("--sim_device", type=str, help="Device for physics simulation. Overrides config file if provided.")
@@ -172,20 +172,10 @@ class Runner:
         obs = obs.to(self.device)
         # build high-level agent
         agent, action_mode = self._build_high_agent()
-
-        self.evaluator = evaluator = ChaseBallEvaluator(
-            max_steps=500, 
-            success_dist_thresh=0.6,
-            tb_prefix="eval",
-            save_dir = os.path.join("logs", "ckpt"),
-            save_best_by = "success_rate",
-            higher_is_better = True,
-            save_every_eval = False,
-        )
         
         episode_step = 0
         episode_return = 0
-        max_steps = 500
+        max_steps = 200
         episode_idx = 0
         CURR_N = int(self.cfg["basic"]["curriculum_window"])
         succ_history = []  # 最近 N 个 episode 的 0/1
@@ -200,20 +190,6 @@ class Runner:
 
                 # ---------- 下发高层命令 ----------
                 mode, action_repr, action_cmd = self._apply_high_level_cmd(action_mode, agent, obs_high)
-
-                # 若是 DQN，额外记录 Q 值（不影响选择逻辑）
-                q_max = q_mean = q_selected = None
-                if mode == "discrete" and hasattr(agent, "q_net"):
-                    with torch.no_grad():
-                        q_vals = agent.q_net(
-                            torch.as_tensor(
-                                obs_high.squeeze(0).cpu().numpy(), 
-                                dtype=torch.float32, 
-                                device=self.device
-                                ).unsqueeze(0))
-                        q_max = float(q_vals.max().item())
-                        q_mean = float(q_vals.mean().item())
-                        q_selected = float(q_vals[0, int(action_repr)].item())
 
                 # ---------- 低层滚动（动作重复） ----------
                 acc_rew_high = 0.0
@@ -260,6 +236,7 @@ class Runner:
                     tb.add_scalar("events/success", 0.0)
                 if not fall_happened:
                     tb.add_scalar("events/fallen", 0.0)
+               
                 # ---------- 高层一步的转移 ----------
                 next_obs_high = self.env.compute_high_level_obs().to(self.device)
                 next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
@@ -270,37 +247,21 @@ class Runner:
                 done_high = (episode_step > max_steps) or success_happened or fall_happened
 
                 # 经验入池
-                if mode == "discrete":
-                    agent.push(
-                        obs_high.squeeze(0).cpu().numpy(),
-                        int(action_repr),   # 动作 id
-                        rew_high,
-                        next_obs_high_np,
-                        done_high
-                    )
-                else:
-                    agent.push(
-                        obs_high.squeeze(0).cpu().numpy(),
-                        np.asarray(action_repr, dtype=np.float32),  # 连续动作
-                        rew_high,
-                        next_obs_high_np,
-                        done_high
-                    )
+                agent.push(
+                    obs_high.squeeze(0).cpu().numpy(),
+                    np.asarray(action_repr, dtype=np.float32),  # 连续动作
+                    rew_high,
+                    next_obs_high_np,
+                    done_high
+                )
 
                 # ---------- TensorBoard ----------
-                if mode == "discrete":
-                    tb.add_scalar("dqn/epsilon", getattr(agent, "epsilon", 0.0))
-                    tb.add_scalar("dqn/update_steps", getattr(agent, "step_count", 0))
-                    tb.add_scalar("high/action_id", int(action_repr))
-                    if q_max is not None: tb.add_scalar("dqn/q_max", q_max)
-                    if q_mean is not None: tb.add_scalar("dqn/q_mean", q_mean)
-                    if q_selected is not None: tb.add_scalar("dqn/q_selected", q_selected)
-                else:
-                    if hasattr(agent, "log_alpha"):
-                        tb.add_scalar("sac/alpha", float(agent.log_alpha.exp().item()))
-                    tb.add_scalar("high/action_vx", float(action_cmd[0]))
-                    tb.add_scalar("high/action_vy", float(action_cmd[1]))
-                    tb.add_scalar("high/action_yaw", float(action_cmd[2]))
+
+                if hasattr(agent, "log_alpha"):
+                    tb.add_scalar("sac/alpha", float(agent.log_alpha.exp().item()))
+                tb.add_scalar("high/action_vx", float(action_cmd[0]))
+                tb.add_scalar("high/action_vy", float(action_cmd[1]))
+                tb.add_scalar("high/action_yaw", float(action_cmd[2]))
 
                 tb.add_scalar("train/replay_size", len(agent.replay_buffer))
                 tb.add_scalar("high/reward", rew_high)
@@ -322,14 +283,6 @@ class Runner:
                             tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
                 global_step += 1
 
-                # ---------- 定期评估 ----------
-                EVAL_EVERY = int(self.cfg["basic"]["eval_every_episodes"])
-                if (episode_idx % EVAL_EVERY == 0) and (episode_idx != 0):
-                    metrics = self.evaluator.evaluate(
-                        env=self.env, low_model=self.model, high_agent=agent,
-                        device=self.device, episodes=5, tb=tb, global_step=global_step
-                    )
-                    print(f"[Eval @ episode {episode_idx} | step {global_step}] {metrics}")
                 # ---------- 回合结束 ----------
                 if done_high:
                     succ = 1.0 if (success_happened and not fall_happened) else 0.0

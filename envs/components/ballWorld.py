@@ -147,7 +147,7 @@ class BallWorld:
         print(f"Robot body positions (env {env_id}):")
         for i in range(num_robot_bodies):
             pos = body_states[env_id, i, 0:3]
-            print(f"  Body {i}: x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}")
+            (f"  Body {i}: x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}")
         ball_pos = body_states[env_id, self.ball_idx, 0:3]
         print(f"Ball position (env {env_id}): x={ball_pos[0]:.3f}, y={ball_pos[1]:.3f}, z={ball_pos[2]:.3f}")
         base = base_pos[env_id, :3]

@@ -117,23 +117,20 @@ class LowLevelController(BaseTask):
         self.ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "SoccerBall",0,0)
         self.addtional_rigid_num += 1
         
-        # 8.1 set ball friction
+        # 8.1 set ball properties
         ball_shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, self.ball_handle)
         for sp in ball_shape_props:
-            sp.friction = 0.95            # 接触摩擦（滚动更“粘”）
+            sp.friction = 0.45            # 接触摩擦（滚动更“粘”）
             # 下面两项在 rc4 存在，控制滚动/扭转能量损失；越大越快停
             if hasattr(sp, "rolling_friction"):
-                sp.rolling_friction = 0.10
+                sp.rolling_friction = 0.05
             if hasattr(sp, "torsion_friction"):
-                sp.torsion_friction = 0.05
-            # 不改 sp.restitution
+                sp.torsion_friction = 0.02
+            
+            sp.restitution = 0.05 # 碰撞恢复系数，0-1，越大越弹
+
         self.gym.set_actor_rigid_shape_properties(env_handle, self.ball_handle, ball_shape_props)
         
-        print("ball friction/rolling/torsion:",
-          [getattr(s, "friction", None) for s in ball_shape_props],
-          [getattr(s, "rolling_friction", None) for s in ball_shape_props],
-          [getattr(s, "torsion_friction", None) for s in ball_shape_props])
-       
         # 9 add other assets
         self.addtional_rigid_num += create_strip_grass(self,env_handle,length=40.0,width=25.0,num_strips=15)
         self.addtional_rigid_num += create_field_boundary_lines(self,env_handle,length=40.0,width=25.0,line_width=0.15)
@@ -161,8 +158,8 @@ class LowLevelController(BaseTask):
         shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, actor_handle)
         for idx in self.foot_shape_indices:
             shape_props[idx].friction = 1.05
-            shape_props[idx].compliance = 1.0
-            shape_props[idx].restitution = 0.5
+            shape_props[idx].compliance = 0.3
+            shape_props[idx].restitution = 0.1
         self.gym.set_actor_rigid_shape_properties(env_handle, actor_handle, shape_props)
         
         self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)

@@ -100,7 +100,11 @@ class PassBallEnv:
                     found = True
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
-    
+
+        self.D_REF = 5.0
+        self.V_REF = 2.0
+        self.OMEGA_REF = 3.0
+
     def reset(self):
         obs, infos = self.controller.reset(
             self.default_dof_pos, self.dof_pos, self.dof_vel, self.dof_state, 
@@ -207,142 +211,120 @@ class PassBallEnv:
 
     def compute_high_level_reward(self):
         """
-        PassBall 奖励：让球尽快、稳定地到达目标点。
-        需要用到：
-        - self.pass_target_xy: torch.tensor([tx, ty], device)  目标点(平面)
-            若未设置则默认用“机器人前方 +3m”。
-        - 缓存变量：
-            self._prev_ball2goal: 上一步球到目标的距离（用于进步项）
-            self._kicked_once: 是否已经完成一次“有效出脚”（接触 + 朝目标方向正速度）
+        极简、无接触力的传球奖励（仅修改本函数）：
+        - 主驱动：球→目标距离的“正向进步”
+        - 辅助：球速度朝目标、几何对齐（机器人-球-目标、以及朝向对齐）、合理靠近球
+        - 约束：侧滑/原地旋转/时间成本
+        - 成功：球接近目标且基本停住
+        输出：
+        - 返回标量张量 reward.shape = (1,)
+        - 在 self.extras["rew_terms"] 写入分解项，保持与现有 TB 键一致
+        - 在 self.extras["success"] 写入布尔成功标志
         """
         dev = self.controller.device
 
-        # --- 目标点（默认：机体当前朝向前方 3m 处） ---
+        # ---------- 目标点（默认：机体前方 3m） ----------
         if not hasattr(self, "pass_target_xy") or self.pass_target_xy is None:
-            # 根据机器人朝向确定世界系前向方向
-            fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1.,0.,0.]], device=dev)).squeeze(0)
-            fwd_xy = fwd_world[:2]
-            fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
-            base_xy = self.base_pos[0, :2]
-            self.pass_target_xy = (base_xy + 3.0 * fwd_xy).detach()  # 前方 3 米
+            fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1., 0., 0.]], device=dev)).squeeze(0)
+            fwd_xy = fwd_world[:2] / (torch.norm(fwd_world[:2]) + 1e-6)
+            self.pass_target_xy = (self.base_pos[0, :2] + 3.0 * fwd_xy).detach()
+        target_xy = self.pass_target_xy  # (2,)
 
-        tx, ty = float(self.pass_target_xy[0]), float(self.pass_target_xy[1])
-        target_xy = torch.tensor([tx, ty], device=dev)
+        # ---------- 关键状态（世界系） ----------
+        robot_xy = self.base_pos[0, :2]
+        ball_idx = self.controller.num_bodies_robot
+        ball_xy  = self.body_states[0, ball_idx, 0:3][:2]
+        ball_vxy = self.body_states[0, ball_idx, 7:10][:2]
 
-        # --- 取关键量（世界系）---
-        robot_pos = self.base_pos[0, :3]
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]
-        ball_vel  = self.body_states[0, ball_idx, 7:10]    # 线速度
+        # 机体线速度：已有机体系 v_body，把它旋回世界系更直观
+        v_body_xy = self.base_lin_vel[0, :2]
+        v_world_xy = quat_rotate(
+            self.base_quat[0:1],
+            torch.cat([v_body_xy, torch.zeros(1, device=dev)], dim=0)[None, :]
+        ).squeeze(0)[:2]
 
-        robot_xy = robot_pos[:2]
-        ball_xy  = ball_pos[:2]
-        v_xy     = self.base_lin_vel[0, :2]                # 机体系速度（post_step 已旋到机体系），但这里只做标量大小不影响方向项
-        ball_vxy = ball_vel[:2]                            # 世界系球速
+        # 前向单位向量（世界系）
+        fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1., 0., 0.]], device=dev)).squeeze(0)[:2]
+        fwd_world = fwd_world / (torch.norm(fwd_world) + 1e-6)
 
-        # 向量
-        to_ball_xy   = (ball_xy - robot_xy)
-        to_ball_d    = torch.norm(to_ball_xy) + 1e-6
-        to_ball_dir  = to_ball_xy / to_ball_d
+        # ---------- 几何向量 ----------
+        # 机器人→球
+        to_ball = ball_xy - robot_xy
+        dist_rb = torch.norm(to_ball) + 1e-6
+        dir_rb  = to_ball / dist_rb
 
-        ball_to_goal = (target_xy - ball_xy)
-        btg_d        = torch.norm(ball_to_goal) + 1e-6
-        btg_dir      = ball_to_goal / btg_d
+        # 球→目标
+        to_goal = target_xy - ball_xy
+        dist_bg = torch.norm(to_goal) + 1e-6
+        dir_bg  = to_goal / dist_bg
+        dir_bg_orth = torch.tensor([-dir_bg[1], dir_bg[0]], device=dev)
 
-        # 机器人朝向（世界系）
-        fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1.,0.,0.]], device=dev)).squeeze(0)
-        fwd_xy = fwd_world[:2]
-        fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
-
-        # --- 关键指标 ---
-        # 1) 目标进步：球->目标距离的减少（只奖正进步），并在近端放大
+        # ---------- 核心信号 ----------
+        # 1) 进步：球→目标距离“正向减少”
         prev = getattr(self, "_prev_ball2goal", None)
         if prev is None:
             progress_raw = torch.tensor(0.0, device=dev)
         else:
-            progress_raw = torch.clamp(prev - btg_d, 0.0, 0.5)
-        progress_gain = progress_raw * (1.0 / (0.5 + btg_d))  # 越近增益越大
-        self._prev_ball2goal = btg_d.detach()
+            progress_raw = torch.clamp(prev - dist_bg, 0.0, 0.5)  # 只奖拉近，不奖拉远
+        # 越接近目标，进步增益越大（dense & shaping）
+        progress_gain = progress_raw * (1.0 / (0.5 + dist_bg))
+        # 缓存当前距离用于下步差分（只在本函数内部使用，不改外部结构）
+        self._prev_ball2goal = dist_bg.detach()
 
-        # 2) 球的速度朝向目标的分量（希望球“真的往目标滚/飞”）
-        ball_speed_toward_goal = torch.dot(ball_vxy, btg_dir)     # 可正可负
-        ball_speed_term = torch.tanh(0.7 * ball_speed_toward_goal)
+        # 2) 球速度朝目标的分量（希望球真的往目标走）
+        ball_speed_toward_goal = torch.dot(ball_vxy, dir_bg)
+        ball_speed_term = torch.tanh(0.7 * ball_speed_toward_goal)  # [-1,1] 内平滑
 
-        # 3) “对准-出脚”几何关系：
-        #    (a) 机器人->球 与 球->目标 大致共线（球在车前，且踢出去的直线对准目标）
-        align_rb_bg = torch.dot(to_ball_dir, btg_dir)             # [-1,1]
-        align_term  = 0.5 * (align_rb_bg + 1.0)                   # [0,1]
+        # 3) 几何对齐
+        #   a) 机器人→球 与 球→目标 共线（鼓励从球的“背面”踢向目标）
+        align_rb_bg = torch.dot(dir_rb, dir_bg)                    # [-1, 1]
+        align_term  = 0.5 * (align_rb_bg + 1.0)                    # [0, 1]
+        #   b) 机器人朝向 与 球→目标方向一致
+        heading_goal_cos = torch.dot(fwd_world, dir_bg)            # [-1, 1]
+        heading_goal_term = 0.5 * (heading_goal_cos + 1.0)         # [0, 1]
 
-        #    (b) 机器人前向与 球->目标 方向一致性（踢的方向不会歪）
-        heading_goal_cos = torch.dot(fwd_xy, btg_dir)             # [-1,1]
-        heading_goal_term = 0.5 * (heading_goal_cos + 1.0)        # [0,1]
-
-        # 4) 近身接触意图：鼓励“接近球 + 有前向速度”，以形成踢球
-        approach_speed = torch.dot(v_xy, to_ball_dir)              # 机体朝球方向的速度
+        # 4) 合理靠近：机体朝球方向的速度分量（避免“绕圈靠近”）
+        approach_speed = torch.dot(v_world_xy, dir_rb)
         approach_term  = torch.tanh(0.8 * approach_speed)          # [-1,1]
 
-        # --- 一次性“踢出”事件判定（用于大额 bonus，只判一次）---
-        if not hasattr(self, "_kicked_once"):
-            self._kicked_once = False
-        kicked_now = (to_ball_d < 0.25) and (approach_speed > 0.10) and (align_rb_bg > 0.6)
-        kick_bonus = 0.0
-        if (not self._kicked_once) and kicked_now:
-            self._kicked_once = True
-            kick_bonus = 2.0  # 你可以调 1~3 之间；只触发一次
-
-        # --- 成功条件：球到达目标并基本停住（或进圈/越线）---
-        success_radius = 0.35   # 目标附近的判定半径
-        settle_speed   = 0.20   # 认为“基本停住/到点”的速度阈值（m/s）
-        success = (btg_d < success_radius) and (torch.norm(ball_vxy) < settle_speed)
-        success_bonus = 6.0 if success else 0.0
-
-        # 若球已经被踢出且离球越来越远，可轻微奖励“与球拉开”（防止一直顶着）
-        sep_term = 0.0
-        if self._kicked_once:
-            sep_term = torch.clamp(to_ball_d - 0.50, min=0.0, max=1.0)  # 距离>0.5m 后给一点点分
-
-        # --- 约束/惩罚 ---
-        # 侧滑抑制（保持动作“干净”）；旋转抑制（防原地转圈）；时间成本
-        to_ball_perp = torch.stack([-to_ball_dir[1], to_ball_dir[0]])
-        speed_orth   = torch.dot(v_xy, to_ball_perp)
+        # 5) 约束：侧滑/自旋/时间
+        speed_orth   = torch.dot(v_world_xy, dir_bg_orth)          # 相对目标线的侧滑速度
         yaw_rate     = self.base_ang_vel[0, 2]
-        spinning     = (torch.abs(approach_speed) < 0.02) * (torch.abs(yaw_rate) > 0.8)
-        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=dev))
-        spin_penalty = torch.clamp(spin_penalty, 0.0, 3.0)
+        spin_penalty = torch.clamp(torch.abs(yaw_rate), 0.0, 3.0)  # 简单抑制原地转
 
-        time_penalty   = 0.01
+        time_penalty = 0.01
         fallen_penalty = 10.0 if self.extras.get("fall", False) else 0.0
 
-        # --- 合成 ---
+        # ---------- 成功判定（不依赖接触/命中） ----------
+        success_radius = 0.35   # 到点半径
+        settle_speed   = 0.20   # 球基本停住阈值
+        success = (dist_bg < success_radius) and (torch.norm(ball_vxy) < settle_speed)
+        success_bonus = 6.0 if success else 0.0
+
+        # ---------- 合成 ----------
         reward = (
-            1.5 * progress_gain           # 球到目标的“距离进步”是最核心的驱动
+            1.5 * progress_gain           # 主驱动：球向目标的距离进步
             + 0.8 * ball_speed_term       # 球速度朝目标
             + 0.5 * align_term            # 机器人-球-目标三点共线
-            + 0.3 * heading_goal_term     # 机器人朝向与目标方向一致
-            + 0.3 * approach_term         # 接近球并准备出脚
-            + 0.2 * sep_term              # 踢出后与球适度拉开
-            + kick_bonus                  # 一次性“踢出”事件奖励
-            + success_bonus               # 成功奖励
+            + 0.3 * heading_goal_term     # 朝向与目标方向一致
+            + 0.3 * approach_term         # 合理靠近球
             - 0.2 * torch.abs(speed_orth) # 侧滑抑制
-            - 0.2 * spin_penalty          # 转圈抑制
+            - 0.2 * spin_penalty          # 原地自旋抑制
             - time_penalty                # 时间成本
-            - fallen_penalty              # 摔倒成本
+            + success_bonus               # 成功奖励
         )
 
-        # --- 日志 ---
-        self.extras["rew_terms"]["btg_dist"]        = btg_d.detach()
-        self.extras["rew_terms"]["progress_gain"]   = progress_gain.detach()
-        self.extras["rew_terms"]["ball_speed_tg"]   = ball_speed_toward_goal.detach()
-        self.extras["rew_terms"]["align_rb_bg"]     = align_rb_bg.detach()
-        self.extras["rew_terms"]["heading_goal"]    = heading_goal_cos.detach()
-        self.extras["rew_terms"]["approach_speed"]  = approach_speed.detach()
-        self.extras["rew_terms"]["speed_orth"]      = speed_orth.detach()
-        self.extras["rew_terms"]["spin_penalty"]    = spin_penalty.detach()
-        self.extras["rew_terms"]["kicked_once"]     = float(self._kicked_once)
+        # ---------- 填写日志键（与现有 TB 对齐） ----------
+        # 注意：dist_xy 按原项目约定记录“机器人-球”的平面距离，保持兼容
+        self.extras["rew_terms"]["dist_xy"]        = dist_rb.detach()
+        self.extras["rew_terms"]["heading_cos"]    = heading_goal_cos.detach()
+        self.extras["rew_terms"]["progress_gain"]  = progress_gain.detach()
+        self.extras["rew_terms"]["speed_toward"]   = approach_speed.detach()   # 这里沿用“朝球”的速度分量命名
+        self.extras["rew_terms"]["speed_orth"]     = speed_orth.detach()
+        self.extras["rew_terms"]["spin_penalty"]   = spin_penalty.detach()
         self.extras["success"] = bool(success)
 
         return reward.view(1).to(dev)
-
 
 
     def apply_high_level_command(self, cmd, smooth=None):
@@ -363,46 +345,85 @@ class PassBallEnv:
     
     def compute_high_level_obs(self):
         """
-        高层观测（自车系，相对量），返回 shape (1, 8)
-        各分量：
-        0-1: delta_xy_body（球在自车坐标系的XY相对位置）
-        2:   dist_xy（平面距离）
-        3-4: cos(bearing), sin(bearing)（指向球的方位角）
-        5-6: v_body_xy（自车系下机体线速度XY）
-        7:   speed_toward（沿着指向球方向的速度分量）
+        高层观测（机体系，相对量），返回 shape (1, 15)
+
+        顺序/维度：
+          0-1  p_ball_rel    球相对机体位置 [x,y]（机体系）
+          2-3  v_ball_rel    球相对机体速度 [vx,vy]（机体系）
+          4-5  p_goal_rel    目标相对机体位置 [x,y]（机体系）
+          6-7  goal_dir_rel  球->目标方向单位向量 [ex,ey]（机体系）
+          8-9  v_base_body   机体线速度 [vx,vy]（机体系）
+          10   omega_z       机体角速度 ω_z（机体系）
+          11-12 heading_err  机体朝向相对“球->目标线”的偏差 [sinΔψ, cosΔψ]
+          13-14 gait_phase   步态相位 [sinφ, cosφ]
+
+        注：已移除“左右足接触标志”两维，以避免依赖接触力。
         """
         device = self.controller.device
 
-        # 取世界系位姿
-        robot_pos = self.base_pos[0, :3]                 # (3,)
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
+        # === 世界系的关键状态 ===
+        robot_pos_w = self.base_pos[0, :3]                          # (3,)
+        robot_quat  = self.base_quat[0:1]                           # (1,4)
+        v_base_body = self.base_lin_vel[0, :2]                      # (2,) 已在 post_step 旋到机体系
+        omega_z     = self.base_ang_vel[0, 2:3]                     # (1,) 已在机体系
 
-        # 世界 -> 自车系：把相对位移旋到机体坐标系
-        delta_world = ball_pos - robot_pos               # (3,)
-        # quat_rotate_inverse 接受 (N,3)，这里用 (1,3) 再 squeeze
-        delta_body  = quat_rotate_inverse(self.base_quat[0:1], delta_world[None, :]).squeeze(0)  # (3,)
-        delta_xy_body = delta_body[:2]                   # (2,)
+        ball_idx    = self.controller.num_bodies_robot
+        ball_pos_w  = self.body_states[0, ball_idx, 0:3]            # (3,)
+        ball_vel_w  = self.body_states[0, ball_idx, 7:10]           # (3,)
 
-        # 距离 & 方位
-        dist_xy = torch.norm(delta_xy_body) + 1e-6
-        bearing = torch.atan2(delta_xy_body[1], delta_xy_body[0])   # 自车系下的方位角
-        cos_b   = torch.cos(bearing)
-        sin_b   = torch.sin(bearing)
+        # 目标点（默认：机体前方 3m；保持与奖励一致）
+        if not hasattr(self, "pass_target_xy") or self.pass_target_xy is None:
+            fwd_world = quat_rotate(robot_quat, torch.tensor([[1., 0., 0.]], device=device)).squeeze(0)  # (3,)
+            fwd_xy = fwd_world[:2]; fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
+            self.pass_target_xy = (robot_pos_w[:2] + 3.0 * fwd_xy).detach()
+        target_xy = self.pass_target_xy  # (2,)
 
-        # 自车系速度 & 朝向球的速度分量
-        v_body_xy = self.base_lin_vel[0, :2]             # 这本来就是在自车系（你在 post_step 里已做了 quat_rotate_inverse）
-        speed_toward = v_body_xy[0] * cos_b + v_body_xy[1] * sin_b
+        # === 机体系旋转 ===
+        # 相对位置（机体系）
+        delta_ball_w = ball_pos_w - robot_pos_w
+        delta_ball_b = quat_rotate_inverse(robot_quat, delta_ball_w[None, :]).squeeze(0)  # (3,)
+        p_ball_rel   = delta_ball_b[:2]                                                   # (2,)
 
-        # 拼接观测向量
-        obs_vec = torch.stack((
-            delta_xy_body[0], delta_xy_body[1],
-            dist_xy, cos_b, sin_b,
-            v_body_xy[0], v_body_xy[1],
-            speed_toward,
-        ), dim=0)  # (8,)
+        delta_goal_w = torch.cat([target_xy - robot_pos_w[:2], torch.zeros(1, device=device)], dim=0)  # (3,)
+        delta_goal_b = quat_rotate_inverse(robot_quat, delta_goal_w[None, :]).squeeze(0)               # (3,)
+        p_goal_rel   = delta_goal_b[:2]                                                                 # (2,)
 
-        return obs_vec.unsqueeze(0)  # (1, 8)
+        # 球速度：先转机体系，再相对机体速度
+        v_ball_b   = quat_rotate_inverse(robot_quat, ball_vel_w[None, :]).squeeze(0)[:2]               # (2,)
+        v_ball_rel = v_ball_b - v_base_body                                                             # (2,)
+
+        # 球->目标方向（世界系单位向量）→ 机体系
+        ball_xy = ball_pos_w[:2]
+        e_world_xy = (target_xy - ball_xy)
+        e_world_xy = e_world_xy / (torch.norm(e_world_xy) + 1e-6)
+        e_world = torch.cat([e_world_xy, torch.zeros(1, device=device)], dim=0)                         # (3,)
+        e_body  = quat_rotate_inverse(robot_quat, e_world[None, :]).squeeze(0)[:2]                      # (2,)
+        goal_dir_rel = e_body
+
+        # 机体朝向（世界系 yaws）：用机体前向与 x 轴夹角近似
+        fwd_world = quat_rotate(robot_quat, torch.tensor([[1., 0., 0.]], device=device)).squeeze(0)     # (3,)
+        yaw_base  = torch.atan2(fwd_world[1], fwd_world[0])
+        e_yaw     = torch.atan2(e_world_xy[1], e_world_xy[0])
+        dpsi      = (yaw_base - e_yaw + np.pi) % (2*np.pi) - np.pi
+        heading_err = torch.stack([torch.sin(dpsi), torch.cos(dpsi)], dim=0)                            # (2,)
+
+        # 相位特征
+        phi = self.gait_process[0]  # ∈ [0,1)
+        gait_phase = torch.tensor([torch.sin(2*np.pi*phi), torch.cos(2*np.pi*phi)], device=device)      # (2,)
+
+        # === 归一化 & 拼接 ===
+        obs = torch.cat([
+            p_ball_rel / self.D_REF,                 # 0-1
+            v_ball_rel / self.V_REF,                 # 2-3
+            p_goal_rel / self.D_REF,                 # 4-5
+            goal_dir_rel,                            # 6-7 (单位向量不归一化)
+            v_base_body / self.V_REF,                # 8-9
+            omega_z / self.OMEGA_REF,                # 10
+            heading_err,                             # 11-12
+            gait_phase,                              # 13-14
+        ], dim=0).clamp_(-2.0, 2.0)  # (15,)
+
+        return obs.unsqueeze(0)  # (1, 15)
 
     def get_dist_xy(self, frame: str = "world"):
         """
