@@ -21,6 +21,7 @@ class LowLevelController(BaseTask):
         self.gym.prepare_sim(self.sim)
 
     def _create_envs(self):
+        # 1. robot asset and ball asset
         booster_asset_cfg = self.cfg["asset"]
         booster_asset_root = os.path.dirname(booster_asset_cfg["file"])
         booster_asset_file = os.path.basename(booster_asset_cfg["file"])
@@ -44,13 +45,11 @@ class LowLevelController(BaseTask):
         
         ball_radius = 0.11
         ball_asset_options = gymapi.AssetOptions()
-        ball_asset_options.density = 80
+        ball_asset_options.density = 80.0
         ball_asset_options.disable_gravity = False
         ball_asset_options.fix_base_link = False
-        ball_asset_options.linear_damping = 0.015
-        ball_asset_options.angular_damping = 0.01
-        ball_asset_options.max_angular_velocity = 100.0
-
+        ball_asset_options.linear_damping = 0.5
+        ball_asset_options.angular_damping = 0.10
         ball_asset = self.gym.create_sphere(self.sim, ball_radius, ball_asset_options)
 
         # === 2. DOF/Body info        
@@ -117,9 +116,21 @@ class LowLevelController(BaseTask):
         ball_pose.p = gymapi.Vec3(1,0.0,ball_radius + 0.01)
         self.ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "SoccerBall",0,0)
         self.addtional_rigid_num += 1
-        # print(f"Total number of rigid bodies: {self.num_bodies_robot}")
-        # print(f"Total number of rigid bodies after ball creation: {self.num_bodies_robot + self.addtional_rigid_num}")
+        
+        # 8.1 set ball properties
+        ball_shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, self.ball_handle)
+        for sp in ball_shape_props:
+            sp.friction = 0.45            # 接触摩擦（滚动更“粘”）
+            # 下面两项在 rc4 存在，控制滚动/扭转能量损失；越大越快停
+            if hasattr(sp, "rolling_friction"):
+                sp.rolling_friction = 0.05
+            if hasattr(sp, "torsion_friction"):
+                sp.torsion_friction = 0.02
+            
+            sp.restitution = 0.05 # 碰撞恢复系数，0-1，越大越弹
 
+        self.gym.set_actor_rigid_shape_properties(env_handle, self.ball_handle, ball_shape_props)
+        
         # 9 add other assets
         self.addtional_rigid_num += create_strip_grass(self,env_handle,length=40.0,width=25.0,num_strips=15)
         self.addtional_rigid_num += create_field_boundary_lines(self,env_handle,length=40.0,width=25.0,line_width=0.15)
@@ -142,12 +153,13 @@ class LowLevelController(BaseTask):
             body_props[j].invMass = 1.0 / body_props[j].mass
 
         self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+        
         # cancel random foot props initialization
         shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, actor_handle)
         for idx in self.foot_shape_indices:
             shape_props[idx].friction = 1.05
-            shape_props[idx].compliance = 1.0
-            shape_props[idx].restitution = 0.5
+            shape_props[idx].compliance = 0.3
+            shape_props[idx].restitution = 0.1
         self.gym.set_actor_rigid_shape_properties(env_handle, actor_handle, shape_props)
         
         self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)
@@ -189,7 +201,6 @@ class LowLevelController(BaseTask):
 
         self._reset_dofs(env_ids, default_dof_pos, dof_pos, dof_vel,dof_state)
         self._reset_root_states(env_ids, root_states_robot, root_states)
-        #self._reset_ball_positions(env_ids, root_states)
         last_dof_targets[env_ids] = dof_pos[env_ids]
         last_root_vel[env_ids] = root_states_robot[env_ids, 7:13]
         episode_length_buf[env_ids] = 0
@@ -222,41 +233,6 @@ class LowLevelController(BaseTask):
         root_states_robot[env_ids, 7:13] = 0.0  # reset base linear and angular velocities
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
 
-    def _reset_ball_positions(self, env_ids, root_states):
-        """
-        把球刷在“以机器人为圆心”的环形带内：
-        r ∈ [r_min, r_max], 角度均匀
-        这样既不会一上来就成功，也不会远得离谱。
-        """
-        # ---- 可调参数（可挪到 cfg["reset"] 里）----
-        r_min = 1.5     # 先易后难：成功阈值(≈0.45)外留点余量
-        r_max = 1.5
-        ball_z = 0.12   # 球半径 + 地面偏移
-
-        # 单环境：root_states[0] 约是机器人，root_states[1] 约是球
-        # 如果后续做多环境，需要改成按 env_ids/actor 索引批量写
-        for _ in env_ids:
-            # 机器人当前世界坐标（用 root_states[0,0:3]）
-            base_x = float(root_states[0, 0].item())
-            base_y = float(root_states[0, 1].item())
-
-            # 环形随机
-            theta = np.random.uniform(-np.pi / 2, np.pi / 2)
-            r = np.random.uniform(r_min, r_max)
-            x = base_x + r * np.cos(theta)
-            y = base_y + r * np.sin(theta)
-
-            # 写球位姿
-            root_states[1, 0] = x
-            root_states[1, 1] = y
-            root_states[1, 2] = ball_z
-            # 清零球速度（线/角速度在 7:13）
-            root_states[1, 7:13] = 0.0
-
-        # 写回仿真
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
-
-
     def _compute_observations(self,
         projected_gravity,base_ang_vel,commands,
         gait_frequency, gait_process,default_dof_pos,dof_pos, dof_vel, actions):
@@ -279,4 +255,3 @@ class LowLevelController(BaseTask):
             ),
             dim=-1,
         )
-

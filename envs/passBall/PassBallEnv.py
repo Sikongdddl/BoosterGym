@@ -8,12 +8,14 @@ from isaacgym.torch_utils import (
     quat_rotate,
 )
 
-from envs.chaseBall.LowLevelController import LowLevelController
+from envs.components.LowLevelController import LowLevelController
+from envs.components.ballWorld import BallWorld
 
-class ChaseBallEnv:
+class PassBallEnv:
     def __init__(self, cfg):
         self.controller = LowLevelController(cfg)
         self._init_buffers()
+        self.ball_world = BallWorld(self.controller, default_z = 0.12)
     
     def _init_buffers(self):
         cfg = self.controller.cfg
@@ -98,16 +100,10 @@ class ChaseBallEnv:
                     found = True
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
-    
-    def set_curriculum_window(self, succ_count:int, epi_count:int):
-        epi_count = max(1, int(epi_count))
-        rate = float(succ_count) / float(epi_count)
-        if rate > 0.6:
-            self.cur_r_max = float(min(8.0, self.cur_r_max + 0.3))
-            print("cur r max is: ", self.cur_r_max)
-        elif rate < 0.3:
-            self.cur_r_max = float(max(1.2, self.cur_r_max - 0.2))
-            print("cur r max is: ", self.cur_r_max)
+
+        self.D_REF = 5.0
+        self.V_REF = 2.0
+        self.OMEGA_REF = 3.0
 
     def reset(self):
         obs, infos = self.controller.reset(
@@ -119,7 +115,15 @@ class ChaseBallEnv:
             self.extras, self.commands, self.gait_frequency, self.dt,
             self.projected_gravity, self.base_ang_vel, self.gait_process, self.actions)
         
-        self._reset_ball_positions(torch.arange(1, device=self.controller.device), self.root_states)
+        self.ball_world.reset_at_feet(
+            root_states=self.root_states,
+            base_pos=self.base_pos,
+            base_quat=self.base_quat,
+            forward_dist=0.30,      # 约= 球半径0.11 + 6~7cm 缓冲，可按实际踢球距离微调
+            lateral_offset=0.0,     # 如果想让球偏左/偏右一点，可设成 ±0.05
+            z=None,                 # 默认用 self.default_z
+            zero_velocity=True
+        )
 
         self._prev_dist_xy = None  # 重置进步奖励计算
         self._milestones_passed.clear()
@@ -206,87 +210,121 @@ class ChaseBallEnv:
         self.last_root_vel[:] = self.root_states_robot[:, 7:13]
 
     def compute_high_level_reward(self):
-        device = self.controller.device
-        # --- 位姿/几何 ---
-        robot_pos = self.base_pos[0, :3]
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]
+        """
+        极简、无接触力的传球奖励（仅修改本函数）：
+        - 主驱动：球→目标距离的“正向进步”
+        - 辅助：球速度朝目标、几何对齐（机器人-球-目标、以及朝向对齐）、合理靠近球
+        - 约束：侧滑/原地旋转/时间成本
+        - 成功：球接近目标且基本停住
+        输出：
+        - 返回标量张量 reward.shape = (1,)
+        - 在 self.extras["rew_terms"] 写入分解项，保持与现有 TB 键一致
+        - 在 self.extras["success"] 写入布尔成功标志
+        """
+        dev = self.controller.device
 
-        delta = ball_pos - robot_pos
-        delta_xy = delta[:2]
-        dist_xy = torch.norm(delta_xy) + 1e-6
-        to_ball_xy = delta_xy / dist_xy
+        # ---------- 目标点（默认：机体前方 3m） ----------
+        if not hasattr(self, "pass_target_xy") or self.pass_target_xy is None:
+            fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1., 0., 0.]], device=dev)).squeeze(0)
+            fwd_xy = fwd_world[:2] / (torch.norm(fwd_world[:2]) + 1e-6)
+            self.pass_target_xy = (self.base_pos[0, :2] + 3.0 * fwd_xy).detach()
+        target_xy = self.pass_target_xy  # (2,)
 
-        # --- 前向与朝向 ---
-        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)
-        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)
-        fwd_xy = fwd_world[:2]
-        fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
-        heading_cos = torch.clamp(torch.dot(fwd_xy, to_ball_xy), -1.0, 1.0)
-        heading_reward = 0.5 * (heading_cos + 1.0)  # [0,1]
+        # ---------- 关键状态（世界系） ----------
+        robot_xy = self.base_pos[0, :2]
+        ball_idx = self.controller.num_bodies_robot
+        ball_xy  = self.body_states[0, ball_idx, 0:3][:2]
+        ball_vxy = self.body_states[0, ball_idx, 7:10][:2]
 
-        # --- 速度分解 ---
-        v_xy = self.base_lin_vel[0, :2]
-        speed_toward = torch.dot(v_xy, to_ball_xy)           # 朝球速度(可正可负)
-        to_ball_perp = torch.stack([-to_ball_xy[1], to_ball_xy[0]])
-        speed_orth   = torch.dot(v_xy, to_ball_perp)         # 侧滑速度
-        speed_reward = torch.tanh(0.8 * speed_toward)        # [-1,1]
+        # 机体线速度：已有机体系 v_body，把它旋回世界系更直观
+        v_body_xy = self.base_lin_vel[0, :2]
+        v_world_xy = quat_rotate(
+            self.base_quat[0:1],
+            torch.cat([v_body_xy, torch.zeros(1, device=dev)], dim=0)[None, :]
+        ).squeeze(0)[:2]
 
-        # --- 反转圈惩罚 ---
-        yaw_rate = self.base_ang_vel[0, 2]
-        spinning = (torch.abs(speed_toward) < 0.02) * (torch.abs(yaw_rate) > 0.8)
-        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=device))
-        spin_penalty = torch.clamp(spin_penalty, 0.0, 3.0)
+        # 前向单位向量（世界系）
+        fwd_world = quat_rotate(self.base_quat[0:1], torch.tensor([[1., 0., 0.]], device=dev)).squeeze(0)[:2]
+        fwd_world = fwd_world / (torch.norm(fwd_world) + 1e-6)
 
-        # --- 进步奖励（放大近端斜率；只奖励正进步）---
-        prev_dist = getattr(self, "_prev_dist_xy", None)
-        if prev_dist is None:
-            progress_raw = torch.tensor(0.0, device=device)
+        # ---------- 几何向量 ----------
+        # 机器人→球
+        to_ball = ball_xy - robot_xy
+        dist_rb = torch.norm(to_ball) + 1e-6
+        dir_rb  = to_ball / dist_rb
+
+        # 球→目标
+        to_goal = target_xy - ball_xy
+        dist_bg = torch.norm(to_goal) + 1e-6
+        dir_bg  = to_goal / dist_bg
+        dir_bg_orth = torch.tensor([-dir_bg[1], dir_bg[0]], device=dev)
+
+        # ---------- 核心信号 ----------
+        # 1) 进步：球→目标距离“正向减少”
+        prev = getattr(self, "_prev_ball2goal", None)
+        if prev is None:
+            progress_raw = torch.tensor(0.0, device=dev)
         else:
-            progress_raw = torch.clamp(prev_dist - dist_xy, 0.0, 0.5)   # 只要正进步
-        # 距离越近，同样的 d 提供更大奖励（1/(dist+c) 放大）
-        progress_gain = progress_raw * (1.0 / (dist_xy + 0.5))
-        self._prev_dist_xy = dist_xy.detach()
+            progress_raw = torch.clamp(prev - dist_bg, 0.0, 0.5)  # 只奖拉近，不奖拉远
+        # 越接近目标，进步增益越大（dense & shaping）
+        progress_gain = progress_raw * (1.0 / (0.5 + dist_bg))
+        # 缓存当前距离用于下步差分（只在本函数内部使用，不改外部结构）
+        self._prev_ball2goal = dist_bg.detach()
 
-        # --- 门控后的朝向项：只有在“确实向前”才给朝向分 ---
-        moving = (speed_toward > 0.03).float()
-        heading_term = moving * heading_reward  # 静止/后退不拿朝向分
+        # 2) 球速度朝目标的分量（希望球真的往目标走）
+        ball_speed_toward_goal = torch.dot(ball_vxy, dir_bg)
+        ball_speed_term = torch.tanh(0.7 * ball_speed_toward_goal)  # [-1,1] 内平滑
 
-        success_thresh = 0.60
-        # --- 成功与一次性奖励（要求“在动”）---
-        success = (dist_xy < success_thresh)
-        init_d = torch.tensor(self.get_initial_dist_xy(), device=device)
-        success_bonus = 3.0 if (success and speed_toward > 0.05) else 0.0
+        # 3) 几何对齐
+        #   a) 机器人→球 与 球→目标 共线（鼓励从球的“背面”踢向目标）
+        align_rb_bg = torch.dot(dir_rb, dir_bg)                    # [-1, 1]
+        align_term  = 0.5 * (align_rb_bg + 1.0)                    # [0, 1]
+        #   b) 机器人朝向 与 球→目标方向一致
+        heading_goal_cos = torch.dot(fwd_world, dir_bg)            # [-1, 1]
+        heading_goal_term = 0.5 * (heading_goal_cos + 1.0)         # [0, 1]
 
-        # --- 每步时间惩罚（稍微加大；建议与步长相称）---
-        time_penalty = 0.01  # 原来是 0.001，太轻了；可按仿真步长微调
+        # 4) 合理靠近：机体朝球方向的速度分量（避免“绕圈靠近”）
+        approach_speed = torch.dot(v_world_xy, dir_rb)
+        approach_term  = torch.tanh(0.8 * approach_speed)          # [-1,1]
 
-        # --- 摔倒惩罚 ---
+        # 5) 约束：侧滑/自旋/时间
+        speed_orth   = torch.dot(v_world_xy, dir_bg_orth)          # 相对目标线的侧滑速度
+        yaw_rate     = self.base_ang_vel[0, 2]
+        spin_penalty = torch.clamp(torch.abs(yaw_rate), 0.0, 3.0)  # 简单抑制原地转
+
+        time_penalty = 0.01
         fallen_penalty = 10.0 if self.extras.get("fall", False) else 0.0
 
-        # --- 合成 ---
+        # ---------- 成功判定（不依赖接触/命中） ----------
+        success_radius = 0.35   # 到点半径
+        settle_speed   = 0.20   # 球基本停住阈值
+        success = (dist_bg < success_radius) and (torch.norm(ball_vxy) < settle_speed)
+        success_bonus = 6.0 if success else 0.0
+
+        # ---------- 合成 ----------
         reward = (
-            1.2 * progress_gain            # 强化“靠近就加分”，且越近增益越大
-            + 0.6 * speed_reward             # 真正向前的速度分
-            + 0.2 * heading_term             # 只在前进时给的朝向分（降权+门控）
-            - 0.2 * torch.abs(speed_orth)    # 侧滑抑制
-            - 0.2 * spin_penalty             # 转圈抑制
-            + success_bonus                  # 成功一次性奖励
-            - time_penalty                   # 时间成本
-            - fallen_penalty                 # 摔倒成本
+            1.5 * progress_gain           # 主驱动：球向目标的距离进步
+            + 0.8 * ball_speed_term       # 球速度朝目标
+            + 0.5 * align_term            # 机器人-球-目标三点共线
+            + 0.3 * heading_goal_term     # 朝向与目标方向一致
+            + 0.3 * approach_term         # 合理靠近球
+            - 0.2 * torch.abs(speed_orth) # 侧滑抑制
+            - 0.2 * spin_penalty          # 原地自旋抑制
+            - time_penalty                # 时间成本
+            + success_bonus               # 成功奖励
         )
 
-        # logging（新增若干项，便于用 TensorBoard 观察）
-        self.extras["rew_terms"]["heading_cos"]     = heading_cos.detach()
-        self.extras["rew_terms"]["heading_term"]    = heading_term.detach()
-        self.extras["rew_terms"]["dist_xy"]         = dist_xy.detach()
-        self.extras["rew_terms"]["progress_gain"]   = progress_gain.detach()
-        self.extras["rew_terms"]["speed_toward"]    = speed_toward.detach()
-        self.extras["rew_terms"]["speed_orth"]      = speed_orth.detach()
-        self.extras["rew_terms"]["spin_penalty"]    = spin_penalty.detach()
+        # ---------- 填写日志键（与现有 TB 对齐） ----------
+        # 注意：dist_xy 按原项目约定记录“机器人-球”的平面距离，保持兼容
+        self.extras["rew_terms"]["dist_xy"]        = dist_rb.detach()
+        self.extras["rew_terms"]["heading_cos"]    = heading_goal_cos.detach()
+        self.extras["rew_terms"]["progress_gain"]  = progress_gain.detach()
+        self.extras["rew_terms"]["speed_toward"]   = approach_speed.detach()   # 这里沿用“朝球”的速度分量命名
+        self.extras["rew_terms"]["speed_orth"]     = speed_orth.detach()
+        self.extras["rew_terms"]["spin_penalty"]   = spin_penalty.detach()
         self.extras["success"] = bool(success)
 
-        return reward.view(1).to(device)
+        return reward.view(1).to(dev)
 
 
     def apply_high_level_command(self, cmd, smooth=None):
@@ -307,46 +345,85 @@ class ChaseBallEnv:
     
     def compute_high_level_obs(self):
         """
-        高层观测（自车系，相对量），返回 shape (1, 8)
-        各分量：
-        0-1: delta_xy_body（球在自车坐标系的XY相对位置）
-        2:   dist_xy（平面距离）
-        3-4: cos(bearing), sin(bearing)（指向球的方位角）
-        5-6: v_body_xy（自车系下机体线速度XY）
-        7:   speed_toward（沿着指向球方向的速度分量）
+        高层观测（机体系，相对量），返回 shape (1, 15)
+
+        顺序/维度：
+          0-1  p_ball_rel    球相对机体位置 [x,y]（机体系）
+          2-3  v_ball_rel    球相对机体速度 [vx,vy]（机体系）
+          4-5  p_goal_rel    目标相对机体位置 [x,y]（机体系）
+          6-7  goal_dir_rel  球->目标方向单位向量 [ex,ey]（机体系）
+          8-9  v_base_body   机体线速度 [vx,vy]（机体系）
+          10   omega_z       机体角速度 ω_z（机体系）
+          11-12 heading_err  机体朝向相对“球->目标线”的偏差 [sinΔψ, cosΔψ]
+          13-14 gait_phase   步态相位 [sinφ, cosφ]
+
+        注：已移除“左右足接触标志”两维，以避免依赖接触力。
         """
         device = self.controller.device
 
-        # 取世界系位姿
-        robot_pos = self.base_pos[0, :3]                 # (3,)
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
+        # === 世界系的关键状态 ===
+        robot_pos_w = self.base_pos[0, :3]                          # (3,)
+        robot_quat  = self.base_quat[0:1]                           # (1,4)
+        v_base_body = self.base_lin_vel[0, :2]                      # (2,) 已在 post_step 旋到机体系
+        omega_z     = self.base_ang_vel[0, 2:3]                     # (1,) 已在机体系
 
-        # 世界 -> 自车系：把相对位移旋到机体坐标系
-        delta_world = ball_pos - robot_pos               # (3,)
-        # quat_rotate_inverse 接受 (N,3)，这里用 (1,3) 再 squeeze
-        delta_body  = quat_rotate_inverse(self.base_quat[0:1], delta_world[None, :]).squeeze(0)  # (3,)
-        delta_xy_body = delta_body[:2]                   # (2,)
+        ball_idx    = self.controller.num_bodies_robot
+        ball_pos_w  = self.body_states[0, ball_idx, 0:3]            # (3,)
+        ball_vel_w  = self.body_states[0, ball_idx, 7:10]           # (3,)
 
-        # 距离 & 方位
-        dist_xy = torch.norm(delta_xy_body) + 1e-6
-        bearing = torch.atan2(delta_xy_body[1], delta_xy_body[0])   # 自车系下的方位角
-        cos_b   = torch.cos(bearing)
-        sin_b   = torch.sin(bearing)
+        # 目标点（默认：机体前方 3m；保持与奖励一致）
+        if not hasattr(self, "pass_target_xy") or self.pass_target_xy is None:
+            fwd_world = quat_rotate(robot_quat, torch.tensor([[1., 0., 0.]], device=device)).squeeze(0)  # (3,)
+            fwd_xy = fwd_world[:2]; fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
+            self.pass_target_xy = (robot_pos_w[:2] + 3.0 * fwd_xy).detach()
+        target_xy = self.pass_target_xy  # (2,)
 
-        # 自车系速度 & 朝向球的速度分量
-        v_body_xy = self.base_lin_vel[0, :2]             # 这本来就是在自车系（你在 post_step 里已做了 quat_rotate_inverse）
-        speed_toward = v_body_xy[0] * cos_b + v_body_xy[1] * sin_b
+        # === 机体系旋转 ===
+        # 相对位置（机体系）
+        delta_ball_w = ball_pos_w - robot_pos_w
+        delta_ball_b = quat_rotate_inverse(robot_quat, delta_ball_w[None, :]).squeeze(0)  # (3,)
+        p_ball_rel   = delta_ball_b[:2]                                                   # (2,)
 
-        # 拼接观测向量
-        obs_vec = torch.stack((
-            delta_xy_body[0], delta_xy_body[1],
-            dist_xy, cos_b, sin_b,
-            v_body_xy[0], v_body_xy[1],
-            speed_toward,
-        ), dim=0)  # (8,)
+        delta_goal_w = torch.cat([target_xy - robot_pos_w[:2], torch.zeros(1, device=device)], dim=0)  # (3,)
+        delta_goal_b = quat_rotate_inverse(robot_quat, delta_goal_w[None, :]).squeeze(0)               # (3,)
+        p_goal_rel   = delta_goal_b[:2]                                                                 # (2,)
 
-        return obs_vec.unsqueeze(0)  # (1, 8)
+        # 球速度：先转机体系，再相对机体速度
+        v_ball_b   = quat_rotate_inverse(robot_quat, ball_vel_w[None, :]).squeeze(0)[:2]               # (2,)
+        v_ball_rel = v_ball_b - v_base_body                                                             # (2,)
+
+        # 球->目标方向（世界系单位向量）→ 机体系
+        ball_xy = ball_pos_w[:2]
+        e_world_xy = (target_xy - ball_xy)
+        e_world_xy = e_world_xy / (torch.norm(e_world_xy) + 1e-6)
+        e_world = torch.cat([e_world_xy, torch.zeros(1, device=device)], dim=0)                         # (3,)
+        e_body  = quat_rotate_inverse(robot_quat, e_world[None, :]).squeeze(0)[:2]                      # (2,)
+        goal_dir_rel = e_body
+
+        # 机体朝向（世界系 yaws）：用机体前向与 x 轴夹角近似
+        fwd_world = quat_rotate(robot_quat, torch.tensor([[1., 0., 0.]], device=device)).squeeze(0)     # (3,)
+        yaw_base  = torch.atan2(fwd_world[1], fwd_world[0])
+        e_yaw     = torch.atan2(e_world_xy[1], e_world_xy[0])
+        dpsi      = (yaw_base - e_yaw + np.pi) % (2*np.pi) - np.pi
+        heading_err = torch.stack([torch.sin(dpsi), torch.cos(dpsi)], dim=0)                            # (2,)
+
+        # 相位特征
+        phi = self.gait_process[0]  # ∈ [0,1)
+        gait_phase = torch.tensor([torch.sin(2*np.pi*phi), torch.cos(2*np.pi*phi)], device=device)      # (2,)
+
+        # === 归一化 & 拼接 ===
+        obs = torch.cat([
+            p_ball_rel / self.D_REF,                 # 0-1
+            v_ball_rel / self.V_REF,                 # 2-3
+            p_goal_rel / self.D_REF,                 # 4-5
+            goal_dir_rel,                            # 6-7 (单位向量不归一化)
+            v_base_body / self.V_REF,                # 8-9
+            omega_z / self.OMEGA_REF,                # 10
+            heading_err,                             # 11-12
+            gait_phase,                              # 13-14
+        ], dim=0).clamp_(-2.0, 2.0)  # (15,)
+
+        return obs.unsqueeze(0)  # (1, 15)
 
     def get_dist_xy(self, frame: str = "world"):
         """
@@ -435,51 +512,6 @@ class ChaseBallEnv:
         large_tilt = tilt > tilt_threshold
 
         return low_z or large_tilt
-
-    # ====== 球的随机与重刷（课程/连击用）======
-    def _reset_ball_positions(self, env_ids, root_states):
-        """
-        把球刷在“以机器人为圆心”的环形带内：r ∈ [cur_r_min, cur_r_max]，角度均匀
-        """
-        r_min = float(getattr(self, "cur_r_min", 0.6))
-        r_max = float(getattr(self, "cur_r_max", 1.5))
-        ball_z = 0.12
-
-        for _ in env_ids:
-            base_x = float(root_states[0, 0].item())
-            base_y = float(root_states[0, 1].item())
-
-            theta = np.random.uniform(-np.pi, np.pi)
-            r = np.random.uniform(r_min, r_max)
-            x = base_x + r * np.cos(theta)
-            y = base_y + r * np.sin(theta)
-
-            root_states[1, 0] = x
-            root_states[1, 1] = y
-            root_states[1, 2] = ball_z
-            root_states[1, 7:13] = 0.0
-
-        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(root_states))
-
-    def respawn_ball_far(self, r_min=2.0, r_max=8.0):
-        """
-        多目标连击：不结束回合，直接把球重刷到远处。
-        """
-        root_states = self.root_states
-        base_x = float(root_states[0, 0].item())
-        base_y = float(root_states[0, 1].item())
-        theta = np.random.uniform(-np.pi, np.pi)
-        r = np.random.uniform(r_min, r_max)
-        root_states[1, 0] = base_x + r * np.cos(theta)
-        root_states[1, 1] = base_y + r * np.sin(theta)
-        root_states[1, 2] = 0.12
-        root_states[1, 7:13] = 0.0
-        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(root_states))
-
-        # 回合中的“重置”局部状态
-        self._prev_dist_xy = None
-        self._milestones_passed.clear()
-        self.initial_dist_xy = self.get_dist_xy()
 
     def debug_print_positions(self):
         # 假设你只有一个env实例，env_id=0
