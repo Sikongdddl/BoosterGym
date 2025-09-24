@@ -44,7 +44,7 @@ class Runner:
 
     # Override config file with args if needed
     def _update_cfg_from_args(self):
-        cfg_file = os.path.join("envs", "passBall",f"{self.args.task}.yaml")
+        cfg_file = os.path.join("envs", "testHLP",f"{self.args.task}.yaml")
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
 

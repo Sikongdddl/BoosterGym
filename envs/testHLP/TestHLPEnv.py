@@ -12,7 +12,7 @@ from envs.components.LowLevelController import LowLevelController
 from envs.components.ballWorld import BallWorld
 from envs.components.curriculum import CurriculumPolicy
 
-class ChaseBallEnv:
+class TestHLPEnv:
     def __init__(self, cfg):
         self.controller = LowLevelController(cfg)
         self._init_buffers()
