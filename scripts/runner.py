@@ -552,6 +552,53 @@ class Runner:
         finally:
             tb.close()
     
+    def testHLPEnv(self):
+        """
+        最小测试循环:reset → step → 打印
+        不依赖任何训练/任务逻辑。
+        """
+        # 1) reset
+        dev = self.device
+        obs, infos = self.env.reset()
+        obs = obs.to(dev)
+
+        # 2) 固定命令（可以按需改）
+        vx, vy, yaw_rate, gait_f = 0.5, 0.0, 0.0, 1.5
+
+        # 3) 回合参数
+        EPISODES = 2
+        MAX_STEPS = 400
+
+        for ep in range(EPISODES):
+            print(f"\n[Episode {ep}] start")
+            obs, _ = self.env.reset()
+            obs = obs.to(dev)
+            N = obs.shape[0]
+
+            for t in range(MAX_STEPS):
+                # 4.1 同步高层命令到环境（供 _compute_observations 使用）
+                self.env.apply_high_level_command([vx, vy, yaw_rate, gait_f], smooth=0.0)
+
+                # 4.2 构造给模型的 obs（把命令显式写入 6:9，保持和你 passBall/chaseBall 一致）
+                obs_mod = obs.clone()
+                obs_mod[:, 6] = vx
+                obs_mod[:, 7] = vy
+                obs_mod[:, 8] = yaw_rate
+
+                with torch.no_grad():
+                    dist = self.model.act(obs_mod)     # 你的 ActorCritic 推理接口
+                    act = dist.loc if hasattr(dist, "loc") else dist
+                    obs, rew, done, infos = self.env.step(act)
+                    obs = obs.to(dev)
+
+                if t % 50 == 0:
+                    print(f"  step={t} | mean|act|={float(act.abs().mean()):.3f} | obs.norm={float(obs.norm().item()):.3f}")
+
+                if torch.is_tensor(done) and done.any().item():
+                    break
+
+            print(f"[Episode {ep}] finished, steps={t+1}")
+    
     if __name__ == "__main__":
         runner = Runner(test=False)
         runner.chaseBall()

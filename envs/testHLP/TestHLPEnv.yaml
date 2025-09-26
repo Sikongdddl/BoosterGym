@@ -9,7 +9,7 @@ basic:
   description: ""
 
 env:
-  num_agents: 1
+  num_agents: 4
   spawn:
     layout: "line" # "line" or "grid" or "random"
     spacing: 1.5
