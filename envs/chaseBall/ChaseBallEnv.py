@@ -7,18 +7,21 @@ from isaacgym.torch_utils import (
     quat_rotate_inverse,
     quat_rotate,
 )
-
+from typing import Dict, Tuple, Optional
 from envs.components.LowLevelController import LowLevelController
 from envs.components.ballWorld import BallWorld
 from envs.components.curriculum import CurriculumPolicy
 
 class ChaseBallEnv:
-    def __init__(self, cfg):
+    def __init__(self, cfg, target_xy):
         self.controller = LowLevelController(cfg)
+        #target_xy: Tensor, shape (2,), 目标在世界坐标系的XY位置
+        self.target_xy = target_xy
         self._init_buffers()
         self.ball_world = BallWorld(self.controller, default_z = 0.12)
         self.curriculum = CurriculumPolicy.from_dict(self.controller.cfg.get("curriculum"))
         self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
+        self._last_curr_info: Optional[Dict] = None  # 记录最近一次课程信息，便于runner取数
 
     def _init_buffers(self):
         cfg = self.controller.cfg
@@ -104,13 +107,20 @@ class ChaseBallEnv:
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
     
-    def set_curriculum_window(self, succ_count:int, epi_count:int):
-        epi_count = max(1, int(epi_count))
-        rate = float(succ_count) / float(epi_count)
-        r_min, r_max = self.curriculum.update_by_success_rate(rate)  # 更新策略内部状态
-        # 同步老字段，方便日志/其它代码直接读
+    def on_episode_end(self, success: bool, episode_idx: int) -> Tuple[float, float, bool, Dict]:
+        """
+        新课程学习入口：每个 episode 结束时调用。
+        使用“同级验证 + 最小驻留 + 冷却 + 比例化步长”的策略更新难度。
+        返回: (r_min, r_max, changed, info)
+        - changed: 本次是否调整了 r_max
+        - info: 包含 rate_global/rate_curr/episodes_at_level 等统计
+        """
+        r_min, r_max, changed, info = self.curriculum.update_on_episode_end(success, episode_idx)
         self.cur_r_min, self.cur_r_max = r_min, r_max
-        print("cur r max is: ", self.cur_r_max)
+        self._last_curr_info = dict(info)
+        if changed:
+            print(f"[Curriculum] ep#{episode_idx} r_max -> {self.cur_r_max:.2f} | {info.get('reason')}")
+        return r_min, r_max, changed, info
 
     def reset(self):
         obs, infos = self.controller.reset(
@@ -210,125 +220,105 @@ class ChaseBallEnv:
         self.last_dof_vel[:] = self.dof_vel
         self.last_root_vel[:] = self.root_states_robot[:, 7:13]
 
-    def compute_high_level_reward(self):
+    def compute_midlevel_reward(self):
         device = self.controller.device
-        # --- 位姿/几何 ---
-        robot_pos = self.base_pos[0, :3]
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]
+        dtype  = self.base_pos.dtype
 
-        delta = ball_pos - robot_pos
-        delta_xy = delta[:2]
-        dist_xy = torch.norm(delta_xy) + 1e-6
-        to_ball_xy = delta_xy / dist_xy
+        # --- 机器人位姿（世界系） ---
+        robot_pos = self.base_pos[0, :3]  # (3,)
+
+        # --- 目标位置（世界系，XY） ---
+        target_xy = self.target_xy
+        # --- 相对几何（仅平面） ---
+        delta_xy = target_xy - robot_pos[:2]              # (2,)
+        dist_xy  = torch.norm(delta_xy) + 1e-6
+        to_t_xy  = delta_xy / dist_xy                     # 单位指向向量
 
         # --- 前向与朝向 ---
-        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device)
-        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)
+        FORWARD_LOCAL = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+        fwd_world = quat_rotate(self.base_quat[0:1], FORWARD_LOCAL[None, :]).squeeze(0)  # (3,)
         fwd_xy = fwd_world[:2]
         fwd_xy = fwd_xy / (torch.norm(fwd_xy) + 1e-6)
-        heading_cos = torch.clamp(torch.dot(fwd_xy, to_ball_xy), -1.0, 1.0)
+        heading_cos = torch.clamp(torch.dot(fwd_xy, to_t_xy), -1.0, 1.0)
         heading_reward = 0.5 * (heading_cos + 1.0)  # [0,1]
 
         # --- 速度分解 ---
-        v_xy = self.base_lin_vel[0, :2]
-        speed_toward = torch.dot(v_xy, to_ball_xy)           # 朝球速度(可正可负)
-        to_ball_perp = torch.stack([-to_ball_xy[1], to_ball_xy[0]])
-        speed_orth   = torch.dot(v_xy, to_ball_perp)         # 侧滑速度
-        speed_reward = torch.tanh(0.8 * speed_toward)        # [-1,1]
+        v_xy = self.base_lin_vel[0, :2]                   # 已在 post_step 旋到机体系
+        speed_toward = torch.dot(v_xy, to_t_xy)           # 朝目标速度(可正可负)
+        to_t_perp = torch.stack([-to_t_xy[1], to_t_xy[0]])
+        speed_orth = torch.dot(v_xy, to_t_perp)           # 侧滑速度
+        speed_reward = torch.tanh(0.8 * speed_toward)     # [-1,1]
 
         # --- 反转圈惩罚 ---
         yaw_rate = self.base_ang_vel[0, 2]
         spinning = (torch.abs(speed_toward) < 0.02) * (torch.abs(yaw_rate) > 0.8)
-        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=device))
+        spin_penalty = torch.where(spinning, torch.abs(yaw_rate), torch.tensor(0.0, device=device, dtype=dtype))
         spin_penalty = torch.clamp(spin_penalty, 0.0, 3.0)
 
-        # --- 进步奖励（放大近端斜率；只奖励正进步）---
+        # --- 进步奖励（序列依赖） ---
         prev_dist = getattr(self, "_prev_dist_xy", None)
         if prev_dist is None:
-            progress_raw = torch.tensor(0.0, device=device)
+            progress_raw = torch.tensor(0.0, device=device, dtype=dtype)
         else:
-            progress_raw = torch.clamp(prev_dist - dist_xy, 0.0, 0.5)   # 只要正进步
-        # 距离越近，同样的 d 提供更大奖励（1/(dist+c) 放大）
+            progress_raw = torch.clamp(prev_dist - dist_xy, 0.0, 0.5)  # 只奖励正进步
         progress_gain = progress_raw * (1.0 / (dist_xy + 0.5))
         self._prev_dist_xy = dist_xy.detach()
 
-        # --- 门控后的朝向项：只有在“确实向前”才给朝向分 ---
+        # --- 门控后的朝向项 ---
         moving = (speed_toward > 0.03).float()
-        heading_term = moving * heading_reward  # 静止/后退不拿朝向分
+        heading_term = moving * heading_reward
 
+        # --- 成功判定与一次性奖励 ---
         success_thresh = 0.60
-        # --- 成功与一次性奖励（要求“在动”）---
         success = (dist_xy < success_thresh)
-        init_d = torch.tensor(self.get_initial_dist_xy(), device=device)
         success_bonus = 3.0 if (success and speed_toward > 0.05) else 0.0
 
-        # --- 每步时间惩罚（稍微加大；建议与步长相称）---
-        time_penalty = 0.01  # 原来是 0.001，太轻了；可按仿真步长微调
-
-        # --- 摔倒惩罚 ---
+        # --- 时间与摔倒惩罚 ---
+        time_penalty = 0.01
         fallen_penalty = 10.0 if self.extras.get("fall", False) else 0.0
 
         # --- 合成 ---
         reward = (
-            1.2 * progress_gain            # 强化“靠近就加分”，且越近增益越大
-            + 0.6 * speed_reward             # 真正向前的速度分
-            + 0.2 * heading_term             # 只在前进时给的朝向分（降权+门控）
-            - 0.2 * torch.abs(speed_orth)    # 侧滑抑制
-            - 0.2 * spin_penalty             # 转圈抑制
-            + success_bonus                  # 成功一次性奖励
-            - time_penalty                   # 时间成本
-            - fallen_penalty                 # 摔倒成本
+            1.2 * progress_gain
+            + 0.6 * speed_reward
+            + 0.2 * heading_term
+            - 0.2 * torch.abs(speed_orth)
+            - 0.2 * spin_penalty
+            + success_bonus
+            - time_penalty
+            - fallen_penalty
         )
 
-        # logging（新增若干项，便于用 TensorBoard 观察）
-        self.extras["rew_terms"]["heading_cos"]     = heading_cos.detach()
-        self.extras["rew_terms"]["heading_term"]    = heading_term.detach()
-        self.extras["rew_terms"]["dist_xy"]         = dist_xy.detach()
-        self.extras["rew_terms"]["progress_gain"]   = progress_gain.detach()
-        self.extras["rew_terms"]["speed_toward"]    = speed_toward.detach()
-        self.extras["rew_terms"]["speed_orth"]      = speed_orth.detach()
-        self.extras["rew_terms"]["spin_penalty"]    = spin_penalty.detach()
+        # --- logging ---
+        self.extras["rew_terms"]["heading_cos"]   = heading_cos.detach()
+        self.extras["rew_terms"]["heading_term"]  = heading_term.detach()
+        self.extras["rew_terms"]["dist_xy"]       = dist_xy.detach()
+        self.extras["rew_terms"]["progress_gain"] = progress_gain.detach()
+        self.extras["rew_terms"]["speed_toward"]  = speed_toward.detach()
+        self.extras["rew_terms"]["speed_orth"]    = speed_orth.detach()
+        self.extras["rew_terms"]["spin_penalty"]  = spin_penalty.detach()
         self.extras["success"] = bool(success)
 
         return reward.view(1).to(device)
 
-
-    def apply_high_level_command(self, cmd, smooth=None):
-        """
-        cmd: [lin_vel_x, lin_vel_y, ang_vel_yaw, gait_freq]
-        smooth: 可选的低通平滑系数 alpha∈[0,1)，None 表示直写
-        """
-        device = self.controller.device
-        # 三个速度指令
-        new_cmd = torch.tensor(cmd[:3], device=device, dtype=self.commands.dtype).view(1, 3)
-        if smooth is None:
-            self.commands[:, :3] = new_cmd
-            self.gait_frequency[:] = float(cmd[3])
-        else:
-            alpha = float(smooth)
-            self.commands[:, :3] = alpha * self.commands[:, :3] + (1 - alpha) * new_cmd
-            self.gait_frequency[:] = alpha * self.gait_frequency + (1 - alpha) * float(cmd[3])
-    
-    def compute_high_level_obs(self):
+    def compute_midlevel_obs(self):
         """
         高层观测（自车系，相对量），返回 shape (1, 8)
         各分量：
-        0-1: delta_xy_body（球在自车坐标系的XY相对位置）
+        0-1: delta_xy_body（target在自车坐标系的XY相对位置）
         2:   dist_xy（平面距离）
-        3-4: cos(bearing), sin(bearing)（指向球的方位角）
+        3-4: cos(bearing), sin(bearing)（指向target的方位角）
         5-6: v_body_xy（自车系下机体线速度XY）
-        7:   speed_toward（沿着指向球方向的速度分量）
+        7:   speed_toward（沿着target方向的速度分量）
         """
         device = self.controller.device
-
+        target_xy = self.target_xy
         # 取世界系位姿
         robot_pos = self.base_pos[0, :3]                 # (3,)
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
 
         # 世界 -> 自车系：把相对位移旋到机体坐标系
-        delta_world = ball_pos - robot_pos               # (3,)
+        delta_world = torch.zeros(3, device=device, dtype=robot_pos.dtype)
+        delta_world[:2] = target_xy - robot_pos[:2]
         # quat_rotate_inverse 接受 (N,3)，这里用 (1,3) 再 squeeze
         delta_body  = quat_rotate_inverse(self.base_quat[0:1], delta_world[None, :]).squeeze(0)  # (3,)
         delta_xy_body = delta_body[:2]                   # (2,)
@@ -361,12 +351,13 @@ class ChaseBallEnv:
         - "body" : 先把相对位移旋到自车系再取范数
         返回: Python float
         """
+        device = self.controller.device
+        dtype  = self.base_pos.dtype
+
         # 取位姿
         robot_pos = self.base_pos[0, :3]                 # (3,)
-        ball_idx  = self.controller.num_bodies_robot
-        ball_pos  = self.body_states[0, ball_idx, 0:3]   # (3,)
-
-        delta_world = ball_pos - robot_pos               # (3,)
+        delta_world = torch.zeros(3, device=device, dtype=dtype)
+        delta_world[:2] = self.target_xy - robot_pos[:2]               # (3,)
 
         if frame == "world":
             dist_xy = torch.norm(delta_world[:2])        # torch scalar
@@ -391,7 +382,7 @@ class ChaseBallEnv:
         self.post_step()
 
         obs = self.controller.obs_buf
-        reward = self.compute_high_level_reward()
+        reward = self.compute_midlevel_reward()
         done = self.reset_buf
         info = self.extras
         return obs, reward, done, info
@@ -404,26 +395,23 @@ class ChaseBallEnv:
         cmd_cfg = self.controller.cfg["commands"]
         gait_freq = 0.5 * (cmd_cfg["gait_frequency"][0] + cmd_cfg["gait_frequency"][1])
         return [0.0, 0.0, 0.0, gait_freq]
-
-    def high_level_action_id_to_vector(self,action_id):
+    
+    def apply_high_level_command(self, cmd, smooth=None):
         """
-        将DQN高层action的ID转换为向量形式
-        due to the discrete action space, the action_id is a single integer
+        cmd: [lin_vel_x, lin_vel_y, ang_vel_yaw, gait_freq]
+        smooth: 可选的低通平滑系数 alpha∈[0,1)，None 表示直写
         """
-        VX_FWD = 0.40
-        YAW = 0.8
-        FREQ = 1.5
-
-        self.action_table = {
-            0: [VX_FWD, 0.0, 0.0, FREQ],  # 前进
-            1: [0.0, 0.0, +YAW, FREQ],  # 向右转
-            2: [0.0, 0.0, -YAW, FREQ], # 向左转
-            3: [0.0, 0.0, 0.0, FREQ],   # 停止
-            4: [VX_FWD, 0.0, +0.5*YAW, FREQ], # 前进并稍微向右转
-            5: [VX_FWD, 0.0, -0.5*YAW, FREQ], # 前进并稍微向左转
-        }
-        return self.action_table.get(int(action_id), [0.0, 0.0, 0.0, FREQ])
-
+        device = self.controller.device
+        # 三个速度指令
+        new_cmd = torch.tensor(cmd[:3], device=device, dtype=self.commands.dtype).view(1, 3)
+        if smooth is None:
+            self.commands[:, :3] = new_cmd
+            self.gait_frequency[:] = float(cmd[3])
+        else:
+            alpha = float(smooth)
+            self.commands[:, :3] = alpha * self.commands[:, :3] + (1 - alpha) * new_cmd
+            self.gait_frequency[:] = alpha * self.gait_frequency + (1 - alpha) * float(cmd[3])
+    
     def _is_fallen(self):
         # height threshold of base
         base_z = float(self.base_pos[0, 2])

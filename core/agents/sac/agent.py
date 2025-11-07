@@ -128,7 +128,7 @@ class SACAgent(BaseAgent):
 
         # 返回一个标量 loss 便于 TB 记录
         total_loss = (q1_loss + q2_loss + pi_loss).item()
-        return True, total_loss
+        return True, q1_loss.item(), q2_loss.item(), pi_loss.item(), alpha_loss.item(), alpha.item()
 
     @torch.no_grad()
     def _soft_update(self, online, target):

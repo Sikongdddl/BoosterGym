@@ -9,10 +9,8 @@ import torch
 
 from utils.model import ActorCritic
 from envs import *
-from core.agents.dqn.agent import DQNAgent
 from core.agents.sac.agent import SACAgent
 from core.utils.logger import TBLogger
-from eval.chaseBallEvaluator import ChaseBallEvaluator
 
 class Runner:
 
@@ -24,7 +22,8 @@ class Runner:
         self._set_seed()
         # env
         task_class = eval(self.cfg["basic"]["task"])
-        self.env = task_class(self.cfg)
+        dummy_target = torch.zeros(2, device=self.cfg["basic"]["rl_device"], dtype=torch.float32)
+        self.env = task_class(self.cfg, dummy_target)
         # device
         self.device = self.cfg["basic"]["rl_device"]
         # low_level locomotion model(already trained)
@@ -34,7 +33,7 @@ class Runner:
     def _get_args(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
-        parser.add_argument("--algo", type=str, choices=["dqn", "sac"], default="dqn", help="High-level RL algorithm: dqn or sac.")
+        parser.add_argument("--algo", type=str, choices=["dqn", "sac"], default="sac", help="High-level RL algorithm: dqn or sac.")
         parser.add_argument("--checkpoint", type=str, help="Path of the model checkpoint to load. Overrides config file if provided.")
         parser.add_argument("--headless", type=bool, help="Run headless without creating a viewer window. Overrides config file if provided.")
         parser.add_argument("--sim_device", type=str, help="Device for physics simulation. Overrides config file if provided.")
@@ -54,10 +53,9 @@ class Runner:
                     self.cfg["env"][arg] = getattr(self.args, arg)
                 else:
                     self.cfg["basic"][arg] = getattr(self.args, arg)
-        self.cfg["basic"].setdefault("algo", "dqn")
+        self.cfg["basic"].setdefault("algo", "sac")
         self.cfg["basic"].setdefault("curriculum_window", 50)     # 最近 N 个 episode 统计成功率
         self.cfg["basic"].setdefault("eval_every_episodes", 100)  # 每 N 个 episode 评估
-        self.cfg["basic"].setdefault("use_respawn_on_success", False)  # True=成功后不结束、刷远球继续追
         self.cfg["basic"].setdefault("respawn_r_min", 2.0)
         self.cfg["basic"].setdefault("respawn_r_max", 8.0)
         if not self.test:
@@ -90,20 +88,16 @@ class Runner:
         model_dict = torch.load(ckpt, map_location=self.device, weights_only=True)
         self.model.load_state_dict(model_dict["model"], strict=False)
 
+    def _set_target_from_ball(self):
+        x,_,_ = self.env.ball_world.get_pose(self.env.root_states)
+        self.env.target_xy = x[:2].to(self.device)
+
     def _build_high_agent(self):
         """根据 algo 构建高层 agent。"""
         algo = self.cfg["basic"]["algo"].lower()
-        obs_high = self.env.compute_high_level_obs().to(self.device)
+        obs_high = self.env.compute_midlevel_obs().to(self.device)
         state_dim = int(obs_high.shape[1])
-
-        if algo == "dqn":
-            # 离散动作数量（来自 env 的查表）
-            # 这里假定你的 env.high_level_action_id_to_vector 支持 id ∈ [0, N-1]
-            # 你当前实现是 6 动（0..5）
-            action_dim = 6
-            agent = DQNAgent(state_dim=state_dim, action_dim=action_dim, device=self.device)
-            action_mode = "discrete"
-        elif algo == "sac":
+        if algo == "sac":
             # 连续动作：这里用 3 维（vx, vy, yaw），步频固定；也可扩成 4 维把步频也学出来
             action_dim = 3
             # 从 cfg 读高层命令的物理范围；提供安全缺省
@@ -170,33 +164,21 @@ class Runner:
         # init
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
+        # 更新目标位置
+        self._set_target_from_ball()
+
         # build high-level agent
         agent, action_mode = self._build_high_agent()
-
-        self.evaluator = evaluator = ChaseBallEvaluator(
-            max_steps=500, 
-            success_dist_thresh=0.6,
-            tb_prefix="eval",
-            save_dir = os.path.join("logs", "ckpt"),
-            save_best_by = "success_rate",
-            higher_is_better = True,
-            save_every_eval = False,
-        )
         
         episode_step = 0
         episode_return = 0
         max_steps = 500
         episode_idx = 0
-        CURR_N = int(self.cfg["basic"]["curriculum_window"])
-        succ_history = []  # 最近 N 个 episode 的 0/1
-        use_respawn = bool(self.cfg["basic"]["use_respawn_on_success"])
-        respawn_r_min = float(self.cfg["basic"]["respawn_r_min"])
-        respawn_r_max = float(self.cfg["basic"]["respawn_r_max"])
 
         try:
             while True:
                 # ---------- 高层观测 ----------
-                obs_high = self.env.compute_high_level_obs().to(self.device)
+                obs_high = self.env.compute_midlevel_obs().to(self.device)
 
                 # ---------- 下发高层命令 ----------
                 mode, action_repr, action_cmd = self._apply_high_level_cmd(action_mode, agent, obs_high)
@@ -246,14 +228,7 @@ class Runner:
                     if isinstance(infos, dict) and infos.get("success", False):
                         success_happened = True     
                         tb.add_scalar("events/success", 1.0)  # 触发就写 1
-                        if use_respawn:
-                            try:
-                                self.env.respawn_ball_far(r_min=respawn_r_min, r_max=respawn_r_max)
-                            except Exception:
-                                pass
-                            # 连击模式下不 break，本高层步继续滚动（你也可以选择 break）
-                        else:
-                            break
+                        break
                     if torch.any(done).item():
                         break
                 if not success_happened:
@@ -261,7 +236,7 @@ class Runner:
                 if not fall_happened:
                     tb.add_scalar("events/fallen", 0.0)
                 # ---------- 高层一步的转移 ----------
-                next_obs_high = self.env.compute_high_level_obs().to(self.device)
+                next_obs_high = self.env.compute_midlevel_obs().to(self.device)
                 next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
                 rew_high = acc_rew_high / ACTION_REPEAT
 
@@ -322,14 +297,12 @@ class Runner:
                             tb.add_scalar("rew/spin_penalty", float(terms["spin_penalty"]))
                 global_step += 1
 
-                # ---------- 定期评估 ----------
-                EVAL_EVERY = int(self.cfg["basic"]["eval_every_episodes"])
-                if (episode_idx % EVAL_EVERY == 0) and (episode_idx != 0):
-                    metrics = self.evaluator.evaluate(
-                        env=self.env, low_model=self.model, high_agent=agent,
-                        device=self.device, episodes=5, tb=tb, global_step=global_step
-                    )
-                    print(f"[Eval @ episode {episode_idx} | step {global_step}] {metrics}")
+                # ---------- 定期保存模型 ----------
+                if (global_step % 10000 == 0) and (len(agent.replay_buffer) >= WARMUP):
+                    os.makedirs(os.path.join("logs", "ckpt"), exist_ok=True)
+                    ckpt_path = os.path.join("logs", "ckpt", f"sac_agent_step_{global_step}.pt")
+                    torch.save({"agent": agent, "global_step": global_step, "cfg": self.cfg}, ckpt_path)
+                    print(f"[Save] SAC agent saved at step {global_step} -> {ckpt_path}")
                 # ---------- 回合结束 ----------
                 if done_high:
                     succ = 1.0 if (success_happened and not fall_happened) else 0.0
@@ -344,29 +317,41 @@ class Runner:
                           f"Step: {episode_step} | Success: {bool(succ)} | "
                           f"InitDist: {self.env.get_initial_dist_xy():.2f}")
 
-                    # 课程统计
-                    succ_history.append(succ)
-                    if len(succ_history) > CURR_N:
-                        succ_history.pop(0)
-                    # 每个 episode 都可以用最近窗口调整一次课程窗口
-                    if episode_idx > 20 :
-                        try:
-                            self.env.set_curriculum_window(succ_count=int(sum(succ_history)), epi_count=len(succ_history))
-                        except Exception:
-                            pass
+                    # === 新：基于“单回合结果”的课程更新（env 内部处理防连跳/冷却/驻留/比例步长） ===
+                    try:
+                        rmin, rmax, changed, info = self.env.on_episode_end(
+                            success=(success_happened and not fall_happened),
+                            episode_idx=episode_idx
+                        )
+                        # 记录关键课程指标（最少也把 r_max 记上）
+                        tb.add_scalar("curr/r_max", float(rmax))
+                        if isinstance(info, dict):
+                            if "rate_global" in info: tb.add_scalar("curr/rate_global", float(info["rate_global"]))
+                            if "rate_curr" in info: tb.add_scalar("curr/rate_curr", float(info["rate_curr"]))
+                            tb.add_scalar("curr/changed", 1.0 if changed else 0.0)
+                        if changed and isinstance(info, dict) and info.get("reason"):
+                            print(f"[Curriculum] ep#{episode_idx} r_max -> {rmax:.2f} | {info['reason']}")
+                    except Exception as e:
+                        print("[Curriculum] update failed:", e)
 
                     episode_idx += 1
                     episode_step = 0
                     episode_return = 0.0
                     obs, infos = self.env.reset()
                     obs = obs.to(self.device)
-
+                    # 更新目标位置
+                    self._set_target_from_ball()
+                    
                 # ---------- 更新 ----------
                 if len(agent.replay_buffer) >= WARMUP:
                     for _ in range(UPDATE_K):
-                        did_update, loss_val = agent.update()
-                        if did_update and (loss_val is not None):
-                            tb.add_scalar("train/loss", loss_val)
+                        did_update, q1_loss, q2_loss, pi_loss, alpha_loss, alpha = agent.update()
+                        if did_update:
+                            tb.add_scalar("train/q1_loss", q1_loss)
+                            tb.add_scalar("train/q2_loss", q2_loss)
+                            tb.add_scalar("train/policy_loss", pi_loss)
+                            tb.add_scalar("train/alpha_loss", alpha_loss)
+                            tb.add_scalar("train/alpha", alpha)
 
                 # 可选：周期性 flush，防 TensorBoard 不刷盘
                 if global_step % 200 == 0:
@@ -376,6 +361,3 @@ class Runner:
         finally:
             tb.close()
     
-    if __name__ == "__main__":
-        runner = Runner(test=False)
-        runner.chaseBall()

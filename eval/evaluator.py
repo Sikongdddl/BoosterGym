@@ -108,7 +108,7 @@ class RLEvaluator:
 
         while True:
             # —— 高层确定性动作（DQN=离散，SAC=连续）
-            obs_high = env.compute_high_level_obs().to(device)
+            obs_high = env.compute_midlevel_obs().to(device)
             obs_high_np = obs_high.squeeze(0).cpu().numpy()
 
             try:
