@@ -71,6 +71,30 @@ class BallWorld:
 
         self.set_pose(root_states, (x, y, z), zero_velocity=True)
 
+    def reset_pass_ball(self, root_states: torch.Tensor,
+                        base_xy=None, z: float = None):
+        """
+        专门给 passBall 用的摆球逻辑（新版）：
+        打桩实现，球固定生成在机器人面前。
+        真正的任务难度由 target 的位置决定。
+        """
+        # 机器人基准位置
+        if base_xy is None:
+            base_x = float(root_states[0, 0].item())
+            base_y = float(root_states[0, 1].item())
+        else:
+            base_x, base_y = float(base_xy[0]), float(base_xy[1])
+
+        z = self.default_z if z is None else float(z)
+
+        # 固定球离机器人“脚下不远”的距离
+        BALL_DIST = 0.5  # 单位：米
+
+        x = base_x + BALL_DIST
+        y = base_y
+
+        self.set_pose(root_states, (x, y, z), zero_velocity=True)
+        
     def respawn_far(self, root_states: torch.Tensor,
                     r_min: float = 2.0, r_max: float = 8.0,
                     base_xy=None, z: float = None):
