@@ -7,7 +7,6 @@ from isaacgym.torch_utils import (
     quat_rotate_inverse,
     quat_rotate,
 )
-
 from typing import Dict, Tuple, Optional
 from envs.components.LowLevelController import LowLevelController
 from envs.components.ballWorld import BallWorld
@@ -290,13 +289,7 @@ class PassBallEnv:
             ball_align_reward = torch.tensor(0.0, device=device, dtype=dtype)
 
         # ========== 4. 触球检测 & 奖励 ==========
-        # 用“球离机器人是否足够近”来近似触球
-        delta_br = ball_xy - robot_pos[:2]
-        ball_to_robot = torch.norm(delta_br)
-
-        touch_radius = 0.4  # 小于这个距离算“脚边/触球”
-        touch_now = ball_to_robot < touch_radius
-
+        touch_now = self.is_feet_contact_ball()  # 使用新的距离检测方法
         prev_touched = getattr(self, "_has_touched_ball", False)
         first_touch = (not prev_touched) and bool(touch_now)
         if touch_now:
@@ -336,12 +329,12 @@ class PassBallEnv:
         r_ball = torch.zeros((), device=device, dtype=dtype)
 
         reward = (
-            r_robot
-            + r_ball
-            + r_touch
-            + r_succ
-            - time_penalty
-            - fallen_penalty
+            r_robot   # 机器人速度方向奖励
+            + r_ball  # 球速度方向奖励
+            + r_touch # 一次性触球大额奖励
+            + r_succ  # 成功奖励
+            - time_penalty # 时间惩罚
+            - fallen_penalty # 摔倒惩罚 
         )
 
         # ========== 8. logging ==========
@@ -378,9 +371,10 @@ class PassBallEnv:
         )
 
         self.extras["success"] = success
+        self.extras["hit"] = bool(first_touch)
 
         # ========== 9. 终端 debug 输出 ==========
-        debug_flag = getattr(self, "debug_reward", True)
+        debug_flag = getattr(self, "debug_reward", False)
         if debug_flag:
             print(
                 "[RewardDebug] "
@@ -452,8 +446,7 @@ class PassBallEnv:
         ], dim=0).to(device=device, dtype=dtype)    # (8,)
 
         return obs.view(1, -1)
-
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
     def get_dist_xy(self, frame: str = "world"):
         """
         返回机器人与球的平面距离（单位：米）。
@@ -521,7 +514,6 @@ class PassBallEnv:
 
         return float(dist_xy.item())
         
-    
     def get_ball_to_target_dist_xy(self, frame: str = "world"):
         """
         返回球与 target_xy 的平面距离（单位：米）。
@@ -637,4 +629,136 @@ class PassBallEnv:
         # 打印机器人底座位置
         base_pos = self.base_pos[env_id, :3]
         print(f"Robot base position (env {env_id}): x={base_pos[0]:.3f}, y={base_pos[1]:.3f}, z={base_pos[2]:.3f}")
+
+    def compute_midlevel_reward_with_goal(self, obs_high, goal_xy):
+        """
+        HER专用：根据给定的goal_xy（虚拟target），重新计算高层奖励。
+        obs_high: shape (8,) 或 (1,8)
+        goal_xy: shape (2,) numpy or torch
+        """
+        device = self.controller.device
+        dtype = self.base_pos.dtype
+        # 解析观测
+        if obs_high.ndim == 2:
+            obs_high = obs_high.squeeze(0)
+        base_x, base_y = obs_high[0], obs_high[1]
+        ball_x, ball_y = obs_high[2], obs_high[3]
+        v_world_x, v_world_y = obs_high[4], obs_high[5]
+        # 使用传入的goal替换target
+        if isinstance(goal_xy, np.ndarray):
+            goal_xy = torch.tensor(goal_xy, dtype=dtype, device=device)
+        target_xy = goal_xy
+        # 机器人/球位姿
+        robot_pos = torch.tensor([base_x, base_y], dtype=dtype, device=device)
+        ball_xy = torch.tensor([ball_x, ball_y], dtype=dtype, device=device)
+        v_world_xy = torch.tensor([v_world_x, v_world_y], dtype=dtype, device=device)
+        # 1. 球->target
+        delta_bt = target_xy - ball_xy
+        ball_dist = torch.norm(delta_bt) + 1e-6
+        dir_bt = delta_bt / ball_dist
+        # 2. 机器人速度方向 vs 球->target
+        robot_speed = torch.norm(v_world_xy)
+        robot_move_thresh = torch.tensor(0.1, device=device, dtype=dtype)
+        if robot_speed > robot_move_thresh:
+            v_dir = v_world_xy / (robot_speed + 1e-6)
+            robot_align_cos = torch.clamp(torch.dot(v_dir, dir_bt), -1.0, 1.0)
+            robot_align_reward = 0.5 * (robot_align_cos + 1.0)
+        else:
+            robot_align_cos = torch.tensor(0.0, device=device, dtype=dtype)
+            robot_align_reward = torch.tensor(0.0, device=device, dtype=dtype)
+        # 3. 触球检测
+        delta_br = ball_xy - robot_pos
+        ball_to_robot = torch.norm(delta_br)
+        touch_radius = 0.4
+        touch_now = ball_to_robot < touch_radius
+        # HER时无法判断是否首次触球，统一不给r_touch
+        r_touch = torch.tensor(0.0, device=device, dtype=dtype)
+        # 4. 成功判定
+        success_thresh = 0.60
+        success = bool((ball_dist < success_thresh).item())
+        r_succ = torch.tensor(80.0 if success else 0.0, device=device, dtype=dtype)
+        # 5. 时间/摔倒惩罚
+        time_penalty = torch.tensor(0.01, device=device, dtype=dtype)
+        fallen_penalty = torch.tensor(0.0, device=device, dtype=dtype)  # HER无法判断
+        # 6. shaping
+        r_robot = 0.3 * robot_align_reward
+        r_ball = torch.zeros((), device=device, dtype=dtype)
+        reward = r_robot + r_ball + r_touch + r_succ - time_penalty - fallen_penalty
+        return float(reward.item())
+
+    def should_early_stop(self):
+        """
+        判断是否可以早停：检测到球和机器人有碰撞（已触球）后，等待球运动一段时间再估算速度。
+        返回: (should_stop: bool, will_succeed: bool)
+        """
+        # 只要 self._has_touched_ball 为 True 就认为已触球
+        if getattr(self, "_has_touched_ball", False):
+            # 预留一段球运动的时间，避免刚触球时速度估算不准
+            if not hasattr(self, "_touch_step_counter"):
+                self._touch_step_counter = self.common_step_counter
+            steps_since_touch = self.common_step_counter - self._touch_step_counter
+            min_steps = 100  # 例如至少等待20步
+            if steps_since_touch < min_steps:
+                return False, False
+            ball_pos, ball_lin_vel, _ = self.ball_world.get_pose(self.root_states)
+            ball_xy = ball_pos[:2]
+            ball_vel_xy = ball_lin_vel[:2]
+            target_xy = self.target_xy
+            delta_bt = target_xy - ball_xy
+            dir_bt = delta_bt / (torch.norm(delta_bt) + 1e-6)
+            linear_damping = 0.015  # 默认值
+            try:
+                linear_damping = self.controller.cfg["asset_ball"]["linear_damping"]
+            except Exception:
+                pass
+            ball_density = 80  # 默认值
+            ball_radius = 0.11  # 默认值
+            try:
+                ball_density = self.controller.cfg["asset_ball"]["density"]
+                ball_radius = self.controller.cfg["asset_ball"]["radius"]
+            except Exception:
+                pass
+            ball_volume = (4.0 / 3.0) * np.pi * (ball_radius ** 3)
+            ball_mass = ball_density * ball_volume
+            v0 = torch.norm(ball_vel_xy).item()
+            s_max = v0 * ball_mass / (linear_damping + 1e-6)
+            ball_final_xy = ball_xy + dir_bt * s_max
+            final_dist = torch.norm(target_xy - ball_final_xy).item()
+            success_thresh = 0.60
+            will_succeed = final_dist < success_thresh
+            return True, will_succeed
+        else:
+            # 没有触球则重置计数器
+            if hasattr(self, "_touch_step_counter"):
+                del self._touch_step_counter
+            # 用底层刚体碰撞检测方法判断是否刚刚触球
+            just_touched = self.is_feet_contact_ball()  # 调用新的距离检测方法
+            if just_touched:
+                self._has_touched_ball = True
+                self._touch_step_counter = self.common_step_counter
+            return False, False
+
+    def is_feet_contact_ball(self):
+        """
+        通过距离检测检查脚部是否与球接触。
+        返回: bool
+        """
+        # 获取脚部的坐标
+        foot_positions = self.body_states[:, self.controller.feet_indices, 0:3]
+
+        # 获取球的位置，假设球是最后一个刚体
+        ball_position = self.body_states[:, self.controller.num_bodies_robot, 0:3]  # 球的坐标，假设是最后一个刚体
+
+        # 计算脚部与球的距离
+        distances = torch.norm(foot_positions - ball_position, dim=2)
+
+        # 设置一个阈值，判断是否接触
+        contact_threshold = 0.25  # 你可以根据实际情况调整这个值
+
+        # 检查是否有脚部与球的距离小于阈值
+        if torch.any(distances < contact_threshold):
+            return True
+        
+        return False
+
 

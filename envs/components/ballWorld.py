@@ -15,15 +15,10 @@ class BallWorld:
     def __init__(self, controller, *, default_z: float = 0.12):
         self.controller = controller
         # 球在 body_states 里的索引：紧随机器人刚体之后
-        self.ball_idx = int(controller.num_bodies_robot)
         self.default_z = float(default_z)
 
         # 兼容：若控制器里已经创建了球（推荐做法），记住 handle；没有也不会影响后续 root-state 写入
         self.ball_handle = getattr(controller, "ball_handle", None)
-
-    # ------ 读/写便捷方法 ------
-    def get_index(self) -> int:
-        return self.ball_idx
 
     def get_pose(self, root_states: torch.Tensor):
         """
@@ -88,7 +83,7 @@ class BallWorld:
         z = self.default_z if z is None else float(z)
 
         # 固定球离机器人“脚下不远”的距离
-        BALL_DIST = 0.5  # 单位：米
+        BALL_DIST = 0.6  # 单位：米
 
         x = base_x + BALL_DIST
         y = base_y
@@ -124,7 +119,7 @@ class BallWorld:
         for i in range(num_robot_bodies):
             pos = body_states[env_id, i, 0:3]
             print(f"  Body {i}: x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}")
-        ball_pos = body_states[env_id, self.ball_idx, 0:3]
+        ball_pos = body_states[env_id, 1, 0:3]
         print(f"Ball position (env {env_id}): x={ball_pos[0]:.3f}, y={ball_pos[1]:.3f}, z={ball_pos[2]:.3f}")
         base = base_pos[env_id, :3]
         print(f"Robot base position (env {env_id}): x={base[0]:.3f}, y={base[1]:.3f}, z={base[2]:.3f}")

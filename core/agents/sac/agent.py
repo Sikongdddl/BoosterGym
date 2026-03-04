@@ -76,7 +76,7 @@ class SACAgent(BaseAgent):
         if len(self.replay_buffer) < self.batch_size:
             return False, None
 
-        s, a, r, s2, d = self.replay_buffer.sample(self.batch_size)
+        s, a, r, s2, d, notes = self.replay_buffer.sample(self.batch_size)
         s   = torch.as_tensor(s, dtype=torch.float32, device=self.device)
         a   = torch.as_tensor(a, dtype=torch.float32, device=self.device)
         r   = torch.as_tensor(r, dtype=torch.float32, device=self.device).unsqueeze(1)

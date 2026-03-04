@@ -256,7 +256,6 @@ class LowLevelController(BaseTask):
         # 写回仿真
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
 
-
     def _compute_observations(self,
         projected_gravity,base_ang_vel,commands,
         gait_frequency, gait_process,default_dof_pos,dof_pos, dof_vel, actions):
@@ -279,4 +278,3 @@ class LowLevelController(BaseTask):
             ),
             dim=-1,
         )
-
