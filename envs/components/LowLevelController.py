@@ -50,6 +50,11 @@ class LowLevelController(BaseTask):
         ball_asset_options.linear_damping = 0.015
         ball_asset_options.angular_damping = 0.01
         ball_asset_options.max_angular_velocity = 100.0
+        # 暴露球动力学参数，供上层任务/早停预测复用
+        self.ball_radius = float(ball_radius)
+        self.ball_density = float(ball_asset_options.density)
+        self.ball_linear_damping = float(ball_asset_options.linear_damping)
+        self.ball_angular_damping = float(ball_asset_options.angular_damping)
 
         ball_asset = self.gym.create_sphere(self.sim, ball_radius, ball_asset_options)
 

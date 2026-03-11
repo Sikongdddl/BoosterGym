@@ -95,9 +95,9 @@ class Runner:
     def _set_target_for_pass(self):
         """
         为 passBall 采样一个新的 target_xy 并写进 env。
-        版本1：任务难度暂时不走 curriculum，
-        直接把 target 固定在一个“看起来像真·传球”的距离上，
-        方向在前方一个小扇形内。
+        采样规则：
+        - 方向：前方小扇形内
+        - 距离：使用 curriculum 当前窗口 [cur_r_min, cur_r_max]
         """
         device = self.device
 
@@ -113,10 +113,12 @@ class Runner:
         dir_x = np.cos(theta)
         dir_y = np.sin(theta)
 
-        # 3) 距离：直接固定在 4~6 米之间，看起来比较像传球
-        TARGET_DIST_MIN = 4.0
-        TARGET_DIST_MAX = 6.0
-        R = np.random.uniform(TARGET_DIST_MIN, TARGET_DIST_MAX)
+        # 3) 距离：按课程窗口采样，确保难度变化真实生效到任务生成
+        r_min = float(getattr(self.env, "cur_r_min", 1.0))
+        r_max = float(getattr(self.env, "cur_r_max", 1.5))
+        if r_max < r_min:
+            r_min, r_max = r_max, r_min
+        R = np.random.uniform(r_min, r_max)
 
         tx = base_x + R * dir_x
         ty = base_y + R * dir_y
@@ -124,7 +126,10 @@ class Runner:
         target_xy = torch.tensor([tx, ty], dtype=self.env.base_pos.dtype, device=device)
         self.env.target_xy = target_xy
 
-        print(f"[Target] R={R:.2f}, theta={theta:.2f} rad, target=({tx:.2f}, {ty:.2f})")
+        print(
+            f"[Target] R={R:.2f} in [{r_min:.2f}, {r_max:.2f}], "
+            f"theta={theta:.2f} rad, target=({tx:.2f}, {ty:.2f})"
+        )
         
     def _build_high_agent(self):
         """根据 algo 构建高层 agent。"""
@@ -208,6 +213,8 @@ class Runner:
         episode_return = 0
         max_steps = 500
         episode_idx = 0
+        EP_RATE_WIN = 200
+        ep_success_window = []
 
         try:
             while True:
@@ -236,8 +243,6 @@ class Runner:
                 last_infos = infos
                 success_happened = False
                 fall_happened = False
-                early_stop_happened = False
-                early_stop_success = False
                 tb.set_step(global_step)
                 tb.add_scalar("train/env_frames", global_step * ACTION_REPEAT)
 
@@ -256,16 +261,6 @@ class Runner:
                     step_rew_high = float(rew)
                     acc_rew_high += step_rew_high
 
-                    # 新增：早停判定优先
-                    if hasattr(self.env, "should_early_stop"):
-                        should_stop, will_succeed = self.env.should_early_stop()
-                        if should_stop:
-                            early_stop_happened = True
-                            early_stop_success = will_succeed
-                            tb.add_scalar("events/early_stop", 1.0)
-                            tb.add_scalar("events/early_success", float(will_succeed))
-                            break
-
                     if isinstance(infos, dict) and infos.get("fall", False):
                         fall_happened = True
                         tb.add_scalar("events/fallen", 1.0)
@@ -283,10 +278,6 @@ class Runner:
 
                     if torch.any(done).item():
                         break
-                if not success_happened:
-                    tb.add_scalar("events/success", 0.0)
-                if not fall_happened:
-                    tb.add_scalar("events/fallen", 0.0)
                 # ---------- 高层一步的转移 ----------
                 next_obs_high = self.env.compute_midlevel_obs().to(self.device)
                 next_obs_high_np = next_obs_high.squeeze(0).cpu().numpy()
@@ -295,11 +286,6 @@ class Runner:
                 episode_step += 1
                 episode_return += rew_high
                 done_high = (episode_step > max_steps) or success_happened or fall_happened
-
-                # 早停后 done_high 也要置为 True，成功标志要用早停结果
-                if early_stop_happened:
-                    done_high = True
-                    success_happened = early_stop_success
 
                 # 经验入池
                 if mode == "discrete":
@@ -363,13 +349,16 @@ class Runner:
                 # ---------- 回合结束 ----------
                 if done_high:
                     succ = 1.0 if (success_happened and not fall_happened) else 0.0
-                    tb.add_scalars("high/episode", {
-                        "return": episode_return,
-                        "length": episode_step,
-                        "success": succ,
-                        "init_dist": self.env.get_initial_dist_xy(),
-                        "cur_r_max": self.env.cur_r_max,
-                    })
+                    ep_success_window.append(succ)
+                    if len(ep_success_window) > EP_RATE_WIN:
+                        ep_success_window.pop(0)
+                    succ_rate = float(sum(ep_success_window) / len(ep_success_window))
+                    tb.add_scalar("episode/return", float(episode_return))
+                    tb.add_scalar("episode/length", float(episode_step))
+                    tb.add_scalar("episode/success", float(succ))
+                    tb.add_scalar("episode/success_rate", succ_rate)
+                    tb.add_scalar("episode/init_dist", float(self.env.get_initial_dist_xy()))
+                    tb.add_scalar("episode/cur_r_max", float(self.env.cur_r_max))
                     print(f"[Episode End] ep#{episode_idx} | Return: {episode_return:.2f} | "
                           f"Step: {episode_step} | Success: {bool(succ)} | "
                           f"InitDist: {self.env.get_initial_dist_xy():.2f}")
@@ -477,6 +466,8 @@ class Runner:
         episode_idx = 0
         hit_happened = False        # 记录是否已触球
         before_hit_indices = []     # 记录本回合所有 before hit 的 buffer 索引
+        EP_RATE_WIN = 200
+        ep_success_window = []
 
         try:
             while True:
@@ -497,8 +488,6 @@ class Runner:
                 last_infos = infos
                 success_happened = False
                 fall_happened = False
-                early_stop_happened = False
-                early_stop_success = False
                 tb.set_step(global_step)
                 tb.add_scalar("train/env_frames", global_step * ACTION_REPEAT)
 
@@ -545,16 +534,6 @@ class Runner:
                     else:
                         acc_rew_high += float(rew)
 
-                    # 新增：早停判定优先
-                    if hasattr(self.env, "should_early_stop"):
-                        should_stop, will_succeed = self.env.should_early_stop()
-                        if should_stop:
-                            early_stop_happened = True
-                            early_stop_success = will_succeed
-                            tb.add_scalar("events/early_stop", 1.0)
-                            tb.add_scalar("events/early_success", float(will_succeed))
-                            break
-
                     if isinstance(infos, dict) and infos.get("fall", False):
                         fall_happened = True
                         tb.add_scalar("events/fallen", 1.0)
@@ -570,6 +549,17 @@ class Runner:
                     if isinstance(infos, dict) and infos.get("hit", False):
                         hit_happened = True
                         tb.add_scalar("events/hit", 1.0)
+                        # 触球即早停：基于“触球当下速度”预测后续轨迹是否会进入成功半径
+                        if hasattr(self.env, "predict_success_after_hit"):
+                            will_succeed, final_dist, s_max, v0 = self.env.predict_success_after_hit()
+                            hit_pred_success = bool(will_succeed)
+                            tb.add_scalar("events/hit_pred_success", float(hit_pred_success))
+                            tb.add_scalar("diag/hit_pred_final_dist", float(final_dist))
+                            tb.add_scalar("diag/hit_pred_s_max", float(s_max))
+                            tb.add_scalar("diag/hit_pred_v0", float(v0))
+                            if hit_pred_success:
+                                success_happened = True
+                                tb.add_scalar("events/success", 1.0)
                         break
 
                     if torch.any(done).item():
@@ -586,10 +576,6 @@ class Runner:
                 else:
                     rew_high = acc_rew_high / ACTION_REPEAT
 
-                if not success_happened:
-                    tb.add_scalar("events/success", 0.0)
-                if not fall_happened:
-                    tb.add_scalar("events/fallen", 0.0)
                 # ---------- 高层一步的转移 ----------
                 _t1 = time.perf_counter()
                 next_obs_high = self.env.compute_midlevel_obs()
@@ -609,35 +595,29 @@ class Runner:
                 episode_return += rew_high
                 done_high = (episode_step > max_steps) or success_happened or fall_happened or hit_happened
 
-                # 早停后 done_high 也要置为 True，成功标志要用早停结果
-                if early_stop_happened:
-                    done_high = True
-                    success_happened = early_stop_success
-
                 # 经验入池，带 note
                 note = "after hit" if hit_happened else "before hit"
                 _t_push = time.perf_counter()
-                # 只采集 before hit：先 push，再用 len(buf)-1 记录下标
+                if mode == "discrete":
+                    agent.replay_buffer.push(
+                        obs_high.squeeze(0).cpu().numpy(),
+                        int(action_repr),
+                        rew_high,
+                        next_obs_high_np,
+                        done_high,
+                        note=note,
+                    )
+                else:
+                    agent.replay_buffer.push(
+                        obs_high.squeeze(0).cpu().numpy(),
+                        np.asarray(action_repr, dtype=np.float32),
+                        rew_high,
+                        next_obs_high_np,
+                        done_high,
+                        note=note,
+                    )
+                # before hit transition 单独记录，供“成功回溯加奖”和 HER 采样
                 if note == "before hit":
-                    if mode == "discrete":
-                        agent.replay_buffer.push(
-                            obs_high.squeeze(0).cpu().numpy(),
-                            int(action_repr),
-                            rew_high,
-                            next_obs_high_np,
-                            done_high,
-                            note=note,
-                        )
-                    else:
-                        agent.replay_buffer.push(
-                            obs_high.squeeze(0).cpu().numpy(),
-                            np.asarray(action_repr, dtype=np.float32),
-                            rew_high,
-                            next_obs_high_np,
-                            done_high,
-                            note=note,
-                        )
-                    # push 之后，最新 transition 的 index 一定是 len(buf)-1
                     buf_idx = len(agent.replay_buffer) - 1
                     before_hit_indices.append(buf_idx)
 
@@ -655,24 +635,48 @@ class Runner:
                 tb.add_scalar("train/replay_size", len(agent.replay_buffer))
                 tb.add_scalar("high/reward", rew_high)
 
-                # ---------- TensorBoard：新 reward 分解 ----------
+                # ---------- TensorBoard：reward 分解（与 PassBallEnv.rew_terms 保持一致） ----------
                 if isinstance(last_infos, dict):
                     terms = last_infos.get("rew_terms", {})
                     if isinstance(terms, dict):
-                        # 来自新 reward：
-                        # ball_dist, ball_progress, ball_speed, align_cos, align_reward, touch_now, first_touch
-                        if "robot_align_cos" in terms:
-                            tb.add_scalar("rew/robot_align_cos", float(terms["robot_align_cos"]))
-                        if "robot_align_reward" in terms:
-                            tb.add_scalar("rew/robot_align_reward", float(terms["robot_align_reward"]))
-                        if "ball_align_cos" in terms:
-                            tb.add_scalar("rew/ball_align_cos", float(terms["ball_align_cos"]))
-                        if "ball_align_reward" in terms:
-                            tb.add_scalar("rew/ball_align_reward", float(terms["ball_align_reward"]))
-                        if "touch_now" in terms:
-                            tb.add_scalar("events/touch_now", float(terms["touch_now"]))
-                        if "first_touch" in terms:
-                            tb.add_scalar("events/first_touch", float(terms["first_touch"]))
+                        # PassBallEnv 当前输出字段（reward 相关）
+                        rew_keys = (
+                            "ball_dist",
+                            "ball_speed",
+                            "ball_align_cos",
+                            "ball_align_reward",
+                            "robot_speed",
+                            "robot_align_cos",
+                            "robot_align_reward",
+                            "robot_to_ball_dist",
+                            "line_cos",
+                            "line_reward",
+                            "line_dist_gate",
+                            "approach_cos",
+                            "approach_reward",
+                            "r_robot",
+                            "r_line",
+                            "r_near_ball",
+                            "r_ball",
+                            "r_touch",
+                            "r_succ",
+                            "far_penalty",
+                            "hack_penalty",
+                            "time_penalty",
+                            "fallen_penalty",
+                        )
+                        for k in rew_keys:
+                            if k in terms:
+                                tb.add_scalar(f"rew/{k}", float(terms[k]))
+
+                        # PassBallEnv 当前输出字段（事件相关）
+                        event_keys = (
+                            "touch_now",
+                            "first_touch",
+                        )
+                        for k in event_keys:
+                            if k in terms:
+                                tb.add_scalar(f"events/{k}", float(terms[k]))
                 global_step += 1
 
                 # ---------- 时间剖析（EMA，减少日志开销） ----------
@@ -707,8 +711,9 @@ class Runner:
 
                 # ---------- 定期保存模型 ----------
                 if (global_step % 10000 == 0) and (len(agent.replay_buffer) >= WARMUP):
-                    os.makedirs(os.path.join("logs", "ckpt"), exist_ok=True)
-                    ckpt_path = os.path.join("logs", "ckpt", f"sac_agent_step_{global_step}.pt")
+                    ckpt_dir = os.path.join("logs", "ckpt", "passBall", "sac")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    ckpt_path = os.path.join(ckpt_dir, f"sac_agent_step_{global_step}.pt")
                     torch.save({"agent": agent, "global_step": global_step, "cfg": self.cfg}, ckpt_path)
                     print(f"[Save] SAC agent saved at step {global_step} -> {ckpt_path}")
 
@@ -716,12 +721,14 @@ class Runner:
                 if done_high:
                     succ = 1.0 if (success_happened and not fall_happened) else 0.0
 
-                    # 这里只保留基本 episode 指标；几何指标以后可以按需要加
-                    tb.add_scalars("high/episode", {
-                        "return": episode_return,
-                        "length": episode_step,
-                        "success": succ,
-                    })
+                    ep_success_window.append(succ)
+                    if len(ep_success_window) > EP_RATE_WIN:
+                        ep_success_window.pop(0)
+                    succ_rate = float(sum(ep_success_window) / len(ep_success_window))
+                    tb.add_scalar("episode/return", float(episode_return))
+                    tb.add_scalar("episode/length", float(episode_step))
+                    tb.add_scalar("episode/success", float(succ))
+                    tb.add_scalar("episode/success_rate", succ_rate)
                     print(f"[Episode End] ep#{episode_idx} | Return: {episode_return:.2f} | "
                         f"Step: {episode_step} | Success: {bool(succ)}")
 
@@ -749,8 +756,8 @@ class Runner:
                         her_goal = ball_pos[:2].detach().cpu().numpy()
                         print(f"[HER] Sampled virtual goal: {her_goal}")
 
-                        # 随机选取 30% 的 before-hit transition 做 HER
-                        num_her = max(1, int(0.3 * len(before_hit_indices)))
+                        # 随机选取 10% 的 before-hit transition 做 HER，避免虚拟样本占比过高
+                        num_her = max(1, int(0.1 * len(before_hit_indices)))
                         her_indices = np.random.choice(before_hit_indices, num_her, replace=False)
 
                         added = 0
@@ -777,9 +784,11 @@ class Runner:
                                 self.env.compute_midlevel_reward_with_goal(
                                     np.asarray(obs_her, dtype=np.float32),
                                     her_goal,
+                                    include_success=False,
                                 )
                             )
-                            done_her = done
+                            # HER 终止：若在 next_obs 下达到虚拟 goal，则标注终止
+                            done_her = bool(done) or (float(np.linalg.norm(next_obs_her[2:4] - her_goal)) < 0.60)
                             note_her = "her"
 
                             # ✅ 统一直接走 replay_buffer.push，带 note
@@ -848,6 +857,272 @@ class Runner:
                     try:
                         tb.flush()
                     except:
+                        pass
+
+        finally:
+            tb.close()
+
+    def trapBall(self):
+        run_name = f"{self.cfg['basic']['task']}_{time.strftime('%Y%m%d-%H%M%S')}"
+        tb = TBLogger(
+            logdir="logs/tb",
+            run_name=run_name
+        )
+        global_step = 0
+
+        ACTION_REPEAT = 10
+        WARMUP = 5000
+        UPDATE_K = 1
+        PROFILE_EVERY = 50
+        _use_cuda_timing = torch.cuda.is_available() and (str(self.device).startswith("cuda"))
+
+        def _cpu_ms(t0: float) -> float:
+            return (time.perf_counter() - t0) * 1000.0
+
+        def _cuda_ms(fn):
+            if (not _use_cuda_timing) or (global_step % PROFILE_EVERY != 0):
+                return fn(), None
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            out = fn()
+            end.record()
+            end.synchronize()
+            return out, float(start.elapsed_time(end))
+
+        _ema = {}
+
+        def _ema_update(key: str, value: float, beta: float = 0.95) -> float:
+            if value is None:
+                return _ema.get(key, None)
+            if key not in _ema:
+                _ema[key] = value
+            else:
+                _ema[key] = beta * _ema[key] + (1.0 - beta) * value
+            return _ema[key]
+
+        obs, infos = self.env.reset()
+        obs = obs.to(self.device)
+
+        agent, action_mode = self._build_high_agent()
+
+        episode_step = 0
+        episode_return = 0.0
+        max_steps = 300
+        episode_idx = 0
+        EP_RATE_WIN = 200
+        ep_success_window = []
+
+        try:
+            while True:
+                _t0 = time.perf_counter()
+                obs_high = self.env.compute_midlevel_obs()
+                if torch.is_tensor(obs_high) and obs_high.device != torch.device(self.device):
+                    obs_high = obs_high.to(self.device)
+                _ema_update("high_obs_ms", _cpu_ms(_t0))
+
+                mode, action_repr, action_cmd = self._apply_high_level_cmd(action_mode, agent, obs_high)
+
+                _t_rollout = time.perf_counter()
+                last_infos = infos
+                success_happened = False
+                fail_happened = False
+                fall_happened = False
+                tb.set_step(global_step)
+                tb.add_scalar("train/env_frames", global_step * ACTION_REPEAT)
+
+                acc_rew_high_t = None
+                acc_rew_high = 0.0
+                obs_mod = obs.clone()
+
+                for _ in range(ACTION_REPEAT):
+                    with torch.no_grad():
+                        obs_mod.copy_(obs)
+                        obs_mod[:, 6], obs_mod[:, 7], obs_mod[:, 8] = (
+                            action_cmd[0], action_cmd[1], action_cmd[2]
+                        )
+
+                        def _low_act():
+                            dist = self.model.act(obs_mod)
+                            return dist.loc
+
+                        act, low_act_ms = _cuda_ms(_low_act)
+                        if low_act_ms is not None:
+                            _ema_update("low_act_ms", low_act_ms)
+
+                        def _env_step():
+                            return self.env.step(act)
+
+                        (obs, rew, done, infos), env_step_ms = _cuda_ms(_env_step)
+                        if env_step_ms is not None:
+                            _ema_update("env_step_ms", env_step_ms)
+
+                        if torch.is_tensor(obs) and obs.device != torch.device(self.device):
+                            obs = obs.to(self.device)
+                        last_infos = infos
+
+                    if torch.is_tensor(rew):
+                        if acc_rew_high_t is None:
+                            acc_rew_high_t = torch.zeros((), device=rew.device, dtype=rew.dtype)
+                        acc_rew_high_t = acc_rew_high_t + rew.reshape(-1)[0]
+                    else:
+                        acc_rew_high += float(rew)
+
+                    if isinstance(infos, dict) and infos.get("fall", False):
+                        fall_happened = True
+                        tb.add_scalar("events/fallen", 1.0)
+                        break
+
+                    if isinstance(infos, dict) and infos.get("success", False):
+                        success_happened = True
+                        tb.add_scalar("events/success", 1.0)
+                        break
+
+                    if isinstance(infos, dict) and infos.get("fail", False):
+                        fail_happened = True
+                        tb.add_scalar("events/fail", 1.0)
+                        break
+
+                    if torch.any(done).item():
+                        break
+
+                _ema_update("rollout_ms", _cpu_ms(_t_rollout))
+
+                if acc_rew_high_t is not None:
+                    rew_high = float((acc_rew_high_t / ACTION_REPEAT).item())
+                else:
+                    rew_high = acc_rew_high / ACTION_REPEAT
+
+                _t1 = time.perf_counter()
+                next_obs_high = self.env.compute_midlevel_obs()
+                if torch.is_tensor(next_obs_high) and next_obs_high.device != torch.device(self.device):
+                    next_obs_high = next_obs_high.to(self.device)
+                _ema_update("next_high_obs_ms", _cpu_ms(_t1))
+
+                _t_np = time.perf_counter()
+                next_obs_high_np = next_obs_high.squeeze(0).detach().cpu().numpy()
+                obs_high_np = obs_high.squeeze(0).detach().cpu().numpy()
+                _ema_update("to_numpy_ms", _cpu_ms(_t_np))
+
+                episode_step += 1
+                episode_return += rew_high
+                done_high = (episode_step > max_steps) or success_happened or fail_happened or fall_happened
+
+                _t_push = time.perf_counter()
+                if mode == "discrete":
+                    agent.replay_buffer.push(
+                        obs_high_np,
+                        int(action_repr),
+                        rew_high,
+                        next_obs_high_np,
+                        done_high,
+                        note="trap",
+                    )
+                else:
+                    agent.replay_buffer.push(
+                        obs_high_np,
+                        np.asarray(action_repr, dtype=np.float32),
+                        rew_high,
+                        next_obs_high_np,
+                        done_high,
+                        note="trap",
+                    )
+                _ema_update("push_ms", _cpu_ms(_t_push))
+
+                if hasattr(agent, "log_alpha"):
+                    tb.add_scalar("sac/alpha", float(agent.log_alpha.exp().item()))
+                tb.add_scalar("high/action_vx", float(action_cmd[0]))
+                tb.add_scalar("high/action_vy", float(action_cmd[1]))
+                tb.add_scalar("high/action_yaw", float(action_cmd[2]))
+                tb.add_scalar("high/reward", rew_high)
+                tb.add_scalar("train/replay_size", len(agent.replay_buffer))
+
+                if isinstance(last_infos, dict):
+                    terms = last_infos.get("rew_terms", {})
+                    if isinstance(terms, dict):
+                        for k, v in terms.items():
+                            try:
+                                tb.add_scalar(f"rew/{k}", float(v))
+                            except Exception:
+                                pass
+                global_step += 1
+
+                if global_step % PROFILE_EVERY == 0:
+                    for key in (
+                        "high_obs_ms",
+                        "next_high_obs_ms",
+                        "rollout_ms",
+                        "low_act_ms",
+                        "env_step_ms",
+                        "to_numpy_ms",
+                        "push_ms",
+                        "update_ms",
+                    ):
+                        v = _ema.get(key, None)
+                        if v is not None:
+                            tb.add_scalar(f"time/{key}", v)
+
+                if global_step % 10000 == 0 and len(agent.replay_buffer) > 0:
+                    try:
+                        agent.replay_buffer.save_to_disk(
+                            save_dir="logs/replay",
+                            filename=f"trap_replay_step_{global_step}_N{len(agent.replay_buffer)}.npz"
+                        )
+                    except Exception as e:
+                        print("[ReplayBuffer] save failed:", e)
+
+                if (global_step % 10000 == 0) and (len(agent.replay_buffer) >= WARMUP):
+                    ckpt_dir = os.path.join("logs", "ckpt", "trapBall", "sac")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    ckpt_path = os.path.join(ckpt_dir, f"sac_agent_step_{global_step}.pt")
+                    torch.save({"agent": agent, "global_step": global_step, "cfg": self.cfg}, ckpt_path)
+                    print(f"[Save] SAC agent saved at step {global_step} -> {ckpt_path}")
+
+                if done_high:
+                    succ = 1.0 if (success_happened and not fall_happened and not fail_happened) else 0.0
+                    ep_success_window.append(succ)
+                    if len(ep_success_window) > EP_RATE_WIN:
+                        ep_success_window.pop(0)
+                    succ_rate = float(sum(ep_success_window) / len(ep_success_window))
+                    tb.add_scalar("episode/return", float(episode_return))
+                    tb.add_scalar("episode/length", float(episode_step))
+                    tb.add_scalar("episode/success", float(succ))
+                    tb.add_scalar("episode/success_rate", succ_rate)
+                    tb.add_scalar("episode/init_dist", float(self.env.get_initial_dist_xy()))
+                    print(
+                        f"[Episode End] ep#{episode_idx} | Return: {episode_return:.2f} | "
+                        f"Step: {episode_step} | Success: {bool(succ)} | "
+                        f"Fail: {bool(fail_happened)} | Fall: {bool(fall_happened)} | "
+                        f"InitDist: {self.env.get_initial_dist_xy():.2f}"
+                    )
+
+                    episode_idx += 1
+                    episode_step = 0
+                    episode_return = 0.0
+                    obs, infos = self.env.reset()
+                    obs = obs.to(self.device)
+
+                if len(agent.replay_buffer) >= WARMUP:
+                    _t_upd = time.perf_counter()
+
+                    def _do_updates():
+                        for _ in range(UPDATE_K):
+                            did_update, q1_loss, q2_loss, pi_loss, alpha_loss, alpha = agent.update()
+                            if did_update:
+                                tb.add_scalar("train/q1_loss", q1_loss)
+                                tb.add_scalar("train/q2_loss", q2_loss)
+                                tb.add_scalar("train/policy_loss", pi_loss)
+                                tb.add_scalar("train/alpha_loss", alpha_loss)
+                                tb.add_scalar("train/alpha", alpha)
+
+                    _, upd_cuda_ms = _cuda_ms(_do_updates)
+                    upd_cpu_ms = _cpu_ms(_t_upd)
+                    _ema_update("update_ms", upd_cuda_ms if upd_cuda_ms is not None else upd_cpu_ms)
+
+                if global_step % 200 == 0:
+                    try:
+                        tb.flush()
+                    except Exception:
                         pass
 
         finally:

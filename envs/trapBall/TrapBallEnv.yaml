@@ -277,11 +277,11 @@ rewards:
   feet_distance_ref: 0.2
 
 curriculum:
-  r_min: 0.6
-  r_max: 1.0
+  r_min: 1.0
+  r_max: 1.5
   inc: 0.3
   dec: 0.2
   r_max_cap: 15.0
-  r_max_floor: 1.0
+  r_max_floor: 1.2
   high_thresh: 0.6
   low_thresh: 0.3

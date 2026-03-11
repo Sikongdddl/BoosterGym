@@ -19,6 +19,22 @@ class BallWorld:
 
         # 兼容：若控制器里已经创建了球（推荐做法），记住 handle；没有也不会影响后续 root-state 写入
         self.ball_handle = getattr(controller, "ball_handle", None)
+        # 复用控制器内实际球参数（避免任务侧再写一份常量）
+        self.ball_radius = float(getattr(controller, "ball_radius", 0.11))
+        self.ball_density = float(getattr(controller, "ball_density", 80.0))
+        self.ball_linear_damping = float(getattr(controller, "ball_linear_damping", 0.015))
+        self.ball_angular_damping = float(getattr(controller, "ball_angular_damping", 0.01))
+
+    def get_dynamics(self):
+        """
+        返回球动力学参数，供奖励/早停/轨迹预测复用。
+        """
+        return {
+            "radius": self.ball_radius,
+            "density": self.ball_density,
+            "linear_damping": self.ball_linear_damping,
+            "angular_damping": self.ball_angular_damping,
+        }
 
     def get_pose(self, root_states: torch.Tensor):
         """
