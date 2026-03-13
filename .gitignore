@@ -3,8 +3,9 @@ logs/
 logs/**
 runs
 runs/**
+videos/
+videos/**
 
 # python cache
 __pycache__/
-
 

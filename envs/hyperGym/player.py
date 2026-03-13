@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 import numpy as np
 
@@ -49,4 +48,3 @@ class Player:
             "velocity": self.velocity.copy(),
             "has_ball": self.has_ball,
         }
-

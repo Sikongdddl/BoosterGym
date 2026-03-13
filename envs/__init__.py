@@ -4,9 +4,8 @@ try:
     from envs.passBall.PassBallEnv import PassBallEnv
     from envs.trapBall.TrapBallEnv import TrapBallEnv
 except ModuleNotFoundError:
+    # Allow lightweight modules like hyperGym to be imported without Isaac Gym.
     LowLevelController = None
     ChaseBallEnv = None
     PassBallEnv = None
     TrapBallEnv = None
-
-from envs.hyperGym import Ball, DataInterface, HyperGymSimulation, Player, TrainingInterface

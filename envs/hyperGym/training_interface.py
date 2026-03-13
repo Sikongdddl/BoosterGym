@@ -10,10 +10,9 @@ import numpy as np
 class TrainingInterface:
     reward_weights: Dict[str, float] = field(default_factory=lambda: {
         "progress": 0.2,
-        "completed_pass": 1.0,
-        "intercepted": -1.0,
-        "turnover": -0.8,
-        "shot": 1.5,
+        "trap": 0.15,
+        "pass": 0.4,
+        "goal": 2.0,
         "step_cost": -0.01,
     })
     _last_ball_x: float = 0.0
@@ -26,19 +25,11 @@ class TrainingInterface:
         current_ball_x = float(state["ball_position"][0])
         reward += (current_ball_x - self._last_ball_x) * float(self.reward_weights["progress"])
         self._last_ball_x = current_ball_x
-
         for event in events:
-            event_type = event["event_type"]
-            if event_type == "pass_completed":
-                reward += float(self.reward_weights["completed_pass"])
-            elif event_type == "intercepted":
-                reward += float(self.reward_weights["intercepted"])
-            elif event_type == "turnover":
-                reward += float(self.reward_weights["turnover"])
-            elif event_type == "shot_taken":
-                reward += float(self.reward_weights["shot"])
+            if event["event_type"] == "trap_completed" and event.get("team") == "home":
+                reward += float(self.reward_weights["trap"])
+            elif event["event_type"] == "pass_started" and event.get("team") == "home":
+                reward += float(self.reward_weights["pass"])
+            elif event["event_type"] == "goal_scored":
+                reward += float(self.reward_weights["goal"] if event.get("team") == "home" else -self.reward_weights["goal"])
         return reward
-
-    def is_terminal(self, state: Dict) -> bool:
-        return bool(state["done"])
-
