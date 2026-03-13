@@ -28,12 +28,25 @@ class HyperParams:
     wall_restitution: float = 0.0
     goal_half_width: float = 1.0
     player_collision_radius: float = 0.22
-    pass_kick_radius: float = 0.28
+    ball_player_restitution: float = 0.35
+    ball_player_damping: float = 0.88
+    ball_motion_substeps: int = 8
+    pass_kick_radius: float = 0.38
     steal_radius: float = 0.2
     shoot_radius: float = 1.2
-    trap_radius: float = 0.24
+    trap_radius: float = 0.38
     trap_velocity_scale: float = 0.18
     trap_stop_speed: float = 0.03
+    contest_radius: float = 0.55
+    trap_safe_speed: float = 0.22
+    pass_safe_speed: float = 0.12
+    unstable_action_switch_penalty: float = 0.12
+    unstable_collision_penalty: float = 0.2
+    unstable_contest_penalty: float = 0.35
+    unstable_ball_speed_penalty: float = 0.25
+    loose_ball_bias: float = 0.7
+    loose_ball_speed_range: Tuple[float, float] = (0.12, 0.35)
+    dead_ball_speed_scale: float = 0.08
     base_intercept_prob: float = 0.15
     defender_speed_scale: float = 1.0
     defender_press_bias: float = 1.0
@@ -67,6 +80,7 @@ class HyperGymSimulation:
         self.num_away = num_away
         self.winner: str | None = None
         self.last_actions: Dict[str, Dict] = {}
+        self.prev_actions: Dict[str, Dict] = {}
         self._build_players()
         self.reset()
 
@@ -89,13 +103,15 @@ class HyperGymSimulation:
                 y = height * (0.3 + 0.4 * away_idx / max(1, self.num_away))
             player.reset(np.asarray([x, y], dtype=np.float32))
 
-        owner = self.players[0]
-        owner.has_ball = False
-        self.ball.reset(owner.position, None)
+        start_ball = self.players[0].position.copy()
+        start_ball[0] += self.params.player_collision_radius + self.ball.radius + 0.02
+        start_ball = self._clip_ball_position(start_ball)
+        self.ball.reset(start_ball, None)
 
     def reset(self) -> np.ndarray:
         self.step_count = 0
         self.winner = None
+        self.prev_actions = {}
         self.last_actions = {}
         self.data.reset()
         self._spawn_layout()
@@ -119,6 +135,7 @@ class HyperGymSimulation:
             opponent_action = self.opponent_policy(self.get_state())
         away_action = self._normalize_action(opponent_action, team="away")
 
+        self.prev_actions = dict(self.last_actions)
         self.last_actions = {"home": home_action, "away": away_action}
         self._apply_team_action(home_action, team="home", step_events=step_events)
         self._apply_team_action(away_action, team="away", step_events=step_events)
@@ -172,16 +189,19 @@ class HyperGymSimulation:
 
         if skill == "pass":
             kicker = team_owner or self._nearest_player(self.ball.position, team=team)
-            if kicker is None or kicker.distance_to(self.ball.position) > self.params.pass_kick_radius:
+            if kicker is None or kicker.distance_to(self.ball.position) > self._ball_interaction_radius(self.params.pass_kick_radius):
                 return
             kicker.has_ball = False
-            self.ball.release_towards(target, self.params.ball_speed)
-            step_events.append({
-                "event_type": "pass_started",
-                "team": team,
-                "from": kicker.player_id,
-                "target": target.copy(),
-            })
+            if self._should_lose_ball(kicker, team, action_type="pass", step_events=step_events):
+                self._apply_loose_ball(kicker, target, team, step_events)
+            else:
+                self.ball.release_towards(target, self.params.ball_speed)
+                step_events.append({
+                    "event_type": "pass_started",
+                    "team": team,
+                    "from": kicker.player_id,
+                    "target": target.copy(),
+                })
             return
 
         if skill == "dribble":
@@ -204,17 +224,20 @@ class HyperGymSimulation:
                 return
             trapper.move_towards(target)
             trapper.clamp(self.params.field_size)
-            if self.ball.owner_id is None and trapper.distance_to(self.ball.position) <= self.params.trap_radius:
-                self.ball.velocity = self.ball.velocity * self.params.trap_velocity_scale
-                speed = float(np.linalg.norm(self.ball.velocity))
-                if speed < self.params.trap_stop_speed:
-                    self.ball.velocity[:] = 0.0
-                step_events.append({
-                    "event_type": "trap_completed",
-                    "team": team,
-                    "by": trapper.player_id,
-                    "ball_speed": float(np.linalg.norm(self.ball.velocity)),
-                })
+            if self.ball.owner_id is None and trapper.distance_to(self.ball.position) <= self._ball_interaction_radius(self.params.trap_radius):
+                if self._should_lose_ball(trapper, team, action_type="trap", step_events=step_events):
+                    self._apply_loose_ball(trapper, self.ball.position.copy(), team, step_events)
+                else:
+                    self.ball.velocity = self.ball.velocity * self.params.trap_velocity_scale
+                    speed = float(np.linalg.norm(self.ball.velocity))
+                    if speed < self.params.trap_stop_speed:
+                        self.ball.velocity[:] = 0.0
+                    step_events.append({
+                        "event_type": "trap_completed",
+                        "team": team,
+                        "by": trapper.player_id,
+                        "ball_speed": float(np.linalg.norm(self.ball.velocity)),
+                    })
             else:
                 step_events.append({"event_type": "trap_attempt", "team": team, "by": trapper.player_id, "target": target.copy()})
             return
@@ -233,26 +256,26 @@ class HyperGymSimulation:
             self.ball.attach_to(owner.player_id, owner.position)
             return
 
-        current = self.ball.position.copy()
-        self.ball.step_free(dt=self.params.sim_dt)
+        damping_rate = self.ball.linear_damping / max(self.ball.mass, 1e-6)
+        substeps = max(1, int(self.params.ball_motion_substeps))
+        sub_dt = self.params.sim_dt / substeps
+        decay = float(np.exp(-damping_rate * sub_dt)) if damping_rate > 1e-8 else 1.0
 
-        scorer = self._check_goal(current, self.ball.position)
-        if scorer is not None:
-            self.winner = scorer
-            step_events.append({"event_type": "goal_scored", "team": scorer})
-            return
+        for _ in range(substeps):
+            self.ball.position = self.ball.position + self.ball.velocity * sub_dt
 
-        max_x, max_y = self.params.field_size
-        min_x = self.ball.radius
-        min_y = self.ball.radius
-        clip_x = float(np.clip(self.ball.position[0], min_x, max(max_x - self.ball.radius, min_x)))
-        clip_y = float(np.clip(self.ball.position[1], min_y, max(max_y - self.ball.radius, min_y)))
-        if not np.isclose(clip_x, float(self.ball.position[0])):
-            self.ball.position[0] = clip_x
-            self.ball.stop_axis(0)
-        if not np.isclose(clip_y, float(self.ball.position[1])):
-            self.ball.position[1] = clip_y
-            self.ball.stop_axis(1)
+            scorer = self._check_goal(self.ball.position, self.ball.position)
+            if scorer is not None:
+                self.winner = scorer
+                step_events.append({"event_type": "goal_scored", "team": scorer})
+                return
+
+            self._resolve_wall_collision(step_events)
+            self._resolve_ball_player_collisions(step_events)
+            self.ball.velocity = self.ball.velocity * decay
+
+        if float(np.linalg.norm(self.ball.velocity)) < 1e-4:
+            self.ball.velocity[:] = 0.0
 
     def _resolve_possession(self, step_events: List[Dict]) -> None:
         owner = self._ball_owner()
@@ -287,6 +310,19 @@ class HyperGymSimulation:
         clipped[0] = float(np.clip(clipped[0], 0.0, width))
         clipped[1] = float(np.clip(clipped[1], 0.0, height))
         return clipped
+
+    def _clip_ball_position(self, position: np.ndarray) -> np.ndarray:
+        width, height = self.params.field_size
+        clipped = np.asarray(position, dtype=np.float32).copy()
+        clipped[0] = float(np.clip(clipped[0], self.ball.radius, width - self.ball.radius))
+        clipped[1] = float(np.clip(clipped[1], self.ball.radius, height - self.ball.radius))
+        return clipped
+
+    def _ball_interaction_radius(self, margin: float) -> float:
+        return max(
+            float(margin),
+            float(self.params.player_collision_radius + self.ball.radius + 0.01),
+        )
 
     def _check_goal(self, start: np.ndarray, end: np.ndarray) -> str | None:
         width, height = self.params.field_size
@@ -336,6 +372,104 @@ class HyperGymSimulation:
                     "event_type": "player_collision_resolved",
                     "players": (a.player_id, b.player_id),
                 })
+
+    def _resolve_wall_collision(self, step_events: List[Dict]) -> None:
+        width, height = self.params.field_size
+        min_x = self.ball.radius
+        max_x = width - self.ball.radius
+        min_y = self.ball.radius
+        max_y = height - self.ball.radius
+        clip_x = float(np.clip(self.ball.position[0], min_x, max_x))
+        clip_y = float(np.clip(self.ball.position[1], min_y, max_y))
+        if not np.isclose(clip_x, float(self.ball.position[0])):
+            self.ball.position[0] = clip_x
+            self.ball.stop_axis(0)
+            step_events.append({"event_type": "ball_wall_collision", "axis": 0})
+        if not np.isclose(clip_y, float(self.ball.position[1])):
+            self.ball.position[1] = clip_y
+            self.ball.stop_axis(1)
+            step_events.append({"event_type": "ball_wall_collision", "axis": 1})
+
+    def _resolve_ball_player_collisions(self, step_events: List[Dict]) -> None:
+        min_dist = self.ball.radius + self.params.player_collision_radius
+        for player in self.players:
+            delta = self.ball.position - player.position
+            dist = float(np.linalg.norm(delta))
+            if dist >= min_dist:
+                continue
+
+            if dist < 1e-8:
+                vel_norm = float(np.linalg.norm(self.ball.velocity))
+                normal = self.ball.velocity / vel_norm if vel_norm > 1e-8 else np.asarray([1.0, 0.0], dtype=np.float32)
+            else:
+                normal = delta / dist
+
+            self.ball.position = player.position + normal * min_dist
+            normal_speed = float(np.dot(self.ball.velocity, normal))
+            tangential = self.ball.velocity - normal_speed * normal
+            if normal_speed < 0.0:
+                reflected = -normal_speed * self.params.ball_player_restitution
+                self.ball.velocity = tangential * self.params.ball_player_damping + normal * reflected
+            else:
+                self.ball.velocity = tangential * self.params.ball_player_damping
+
+            if float(np.linalg.norm(self.ball.velocity)) < self.params.trap_stop_speed:
+                self.ball.velocity[:] = 0.0
+
+            step_events.append({"event_type": "ball_player_collision", "player": player.player_id})
+
+    def _should_lose_ball(self, actor: Player, team: str, action_type: str, step_events: List[Dict]) -> bool:
+        risk = 0.0
+        opponents = [player for player in self.players if player.team != team]
+        nearest_opp_dist = min((player.distance_to(self.ball.position) for player in opponents), default=999.0)
+        if nearest_opp_dist < self.params.contest_radius:
+            risk += self.params.unstable_contest_penalty
+
+        ball_speed = float(np.linalg.norm(self.ball.velocity))
+        safe_speed = self.params.pass_safe_speed if action_type == "pass" else self.params.trap_safe_speed
+        if ball_speed > safe_speed:
+            risk += self.params.unstable_ball_speed_penalty
+
+        last_action = self.prev_actions.get(team, {})
+        if last_action and last_action.get("skill") not in {action_type, "move"}:
+            risk += self.params.unstable_action_switch_penalty
+
+        if any(evt.get("event_type") == "player_collision_resolved" and actor.player_id in evt.get("players", ()) for evt in step_events):
+            risk += self.params.unstable_collision_penalty
+
+        risk = float(np.clip(risk, 0.0, 0.92))
+        return bool(risk > 0.0 and self.rng.random() < risk)
+
+    def _apply_loose_ball(self, actor: Player, target: np.ndarray, team: str, step_events: List[Dict]) -> None:
+        target_dir = np.asarray(target, dtype=np.float32) - actor.position
+        norm = float(np.linalg.norm(target_dir))
+        if norm < 1e-8:
+            angle = self.rng.uniform(0.0, 2.0 * np.pi)
+            direction = np.asarray([np.cos(angle), np.sin(angle)], dtype=np.float32)
+        else:
+            direction = target_dir / norm
+
+        if self.rng.random() < self.params.loose_ball_bias:
+            angle_jitter = self.rng.uniform(-0.9, 0.9)
+            rot = np.asarray(
+                [
+                    [np.cos(angle_jitter), -np.sin(angle_jitter)],
+                    [np.sin(angle_jitter), np.cos(angle_jitter)],
+                ],
+                dtype=np.float32,
+            )
+            loose_dir = rot @ direction
+            loose_speed = self.rng.uniform(*self.params.loose_ball_speed_range)
+            self.ball.velocity = loose_dir * float(loose_speed)
+            self.ball.position = self._clip_ball_position(actor.position + loose_dir * (self.params.player_collision_radius + self.ball.radius + 0.03))
+            step_events.append({"event_type": "loose_ball", "team": team, "by": actor.player_id, "ball_speed": float(np.linalg.norm(self.ball.velocity))})
+        else:
+            speed = float(np.linalg.norm(self.ball.velocity))
+            self.ball.velocity = direction * speed * self.params.dead_ball_speed_scale
+            if float(np.linalg.norm(self.ball.velocity)) < self.params.trap_stop_speed:
+                self.ball.velocity[:] = 0.0
+            self.ball.position = self._clip_ball_position(actor.position + direction * (self.params.player_collision_radius + self.ball.radius + 0.01))
+            step_events.append({"event_type": "dead_ball", "team": team, "by": actor.player_id, "ball_speed": float(np.linalg.norm(self.ball.velocity))})
 
     def _build_state(self) -> Dict:
         return {
