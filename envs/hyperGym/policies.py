@@ -11,7 +11,7 @@ class ScriptedSoccerPolicy:
     team: str
     rng: np.random.Generator
 
-    def act(self, state: Dict) -> Dict:
+    def act(self, state: Dict) -> Dict[str, Dict]:
         field_size = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
         field_w = float(field_size[0])
         field_h = float(field_size[1])
@@ -28,73 +28,136 @@ class ScriptedSoccerPolicy:
         own_goal_x = 0.0 if self.team == "home" else field_w
         goal_center = np.asarray([goal_x, field_h * 0.5], dtype=np.float32)
         own_goal = np.asarray([own_goal_x, field_h * 0.5], dtype=np.float32)
-        owner = next((player for player in teammates if player["player_id"] == owner_id), None)
-        active = owner
-        if active is None:
-            active = min(teammates, key=lambda player: float(np.linalg.norm(np.asarray(player["position"], dtype=np.float32) - ball)))
-        primary_opponent = min(opponents, key=lambda player: float(np.linalg.norm(np.asarray(player["position"], dtype=np.float32) - ball)))
-        my_pos = np.asarray(active["position"], dtype=np.float32)
-        opp_pos = np.asarray(primary_opponent["position"], dtype=np.float32)
-        support_teammate = self._select_support_teammate(teammates, active["player_id"], goal_center)
 
-        if owner_id == active["player_id"]:
-            dist_to_goal = float(np.linalg.norm(goal_center - my_pos))
-            lane_open = abs(float(my_pos[1] - goal_center[1])) < 1.25
+        owner = next((player for player in teammates if player["player_id"] == owner_id), None)
+        primary = owner
+        if primary is None:
+            primary = min(teammates, key=lambda player: float(np.linalg.norm(np.asarray(player["position"], dtype=np.float32) - ball)))
+
+        primary_opponent = min(opponents, key=lambda player: float(np.linalg.norm(np.asarray(player["position"], dtype=np.float32) - ball)))
+        primary_pos = np.asarray(primary["position"], dtype=np.float32)
+        opponent_pos = np.asarray(primary_opponent["position"], dtype=np.float32)
+        support_targets = self._build_support_targets(
+            teammates=teammates,
+            primary_id=primary["player_id"],
+            goal_center=goal_center,
+            own_goal=own_goal,
+            ball=ball,
+            attack_sign=attack_sign,
+            field_h=field_h,
+        )
+
+        actions: Dict[str, Dict] = {}
+        for teammate in teammates:
+            if teammate["player_id"] == primary["player_id"]:
+                actions[teammate["player_id"]] = self._primary_action(
+                    primary=primary,
+                    teammates=teammates,
+                    opponents=opponents,
+                    goal_center=goal_center,
+                    attack_sign=attack_sign,
+                    field_h=field_h,
+                    ball=ball,
+                    ball_speed=ball_speed,
+                    owner_id=owner_id,
+                    opponent_pos=opponent_pos,
+                )
+            else:
+                target = support_targets.get(teammate["player_id"], np.asarray(teammate["position"], dtype=np.float32))
+                actions[teammate["player_id"]] = {"skill": "move", "target": target}
+        return actions
+
+    def _primary_action(
+        self,
+        primary: Dict,
+        teammates: list[Dict],
+        opponents: list[Dict],
+        goal_center: np.ndarray,
+        attack_sign: float,
+        field_h: float,
+        ball: np.ndarray,
+        ball_speed: float,
+        owner_id: str | None,
+        opponent_pos: np.ndarray,
+    ) -> Dict:
+        primary_pos = np.asarray(primary["position"], dtype=np.float32)
+        support_teammate = self._select_support_teammate(teammates, primary["player_id"], goal_center)
+
+        if owner_id == primary["player_id"]:
+            dist_to_goal = float(np.linalg.norm(goal_center - primary_pos))
+            lane_open = abs(float(primary_pos[1] - goal_center[1])) < 1.25
             if dist_to_goal < 2.4 and lane_open:
                 shot_target = goal_center + np.asarray([0.45 * attack_sign, 0.0], dtype=np.float32)
                 return {"skill": "pass", "target": shot_target}
 
-            if support_teammate is not None and self._is_pass_lane_open(my_pos, np.asarray(support_teammate["position"], dtype=np.float32), opponents):
+            if support_teammate is not None and self._is_pass_lane_open(primary_pos, np.asarray(support_teammate["position"], dtype=np.float32), opponents):
                 mate_pos = np.asarray(support_teammate["position"], dtype=np.float32)
                 lead_target = mate_pos + np.asarray([0.35 * attack_sign, 0.0], dtype=np.float32)
-                if float(np.linalg.norm(mate_pos - my_pos)) > 1.4 and self.rng.random() < 0.35:
+                if float(np.linalg.norm(mate_pos - primary_pos)) > 1.4 and self.rng.random() < 0.35:
                     return {"skill": "pass", "target": lead_target}
 
-            if float(np.linalg.norm(opp_pos - my_pos)) < 0.85:
+            if float(np.linalg.norm(opponent_pos - primary_pos)) < 0.85:
                 lane_offset = self.rng.uniform(-1.1, 1.1)
                 through_target = np.asarray([
-                    my_pos[0] + attack_sign * self.rng.uniform(1.6, 2.8),
+                    primary_pos[0] + attack_sign * self.rng.uniform(1.6, 2.8),
                     np.clip(goal_center[1] + lane_offset, 0.35, field_h - 0.35),
                 ], dtype=np.float32)
                 return {"skill": "pass", "target": through_target}
 
             if self.rng.random() < 0.22:
                 touch_target = np.asarray([
-                    my_pos[0] + attack_sign * self.rng.uniform(1.2, 2.1),
-                    np.clip(0.6 * my_pos[1] + 0.4 * goal_center[1] + self.rng.uniform(-0.5, 0.5), 0.35, field_h - 0.35),
+                    primary_pos[0] + attack_sign * self.rng.uniform(1.2, 2.1),
+                    np.clip(0.6 * primary_pos[1] + 0.4 * goal_center[1] + self.rng.uniform(-0.5, 0.5), 0.35, field_h - 0.35),
                 ], dtype=np.float32)
                 return {"skill": "pass", "target": touch_target}
 
             forward_target = np.asarray([
-                my_pos[0] + attack_sign * self.rng.uniform(0.7, 1.15),
-                np.clip(0.6 * my_pos[1] + 0.4 * goal_center[1] + self.rng.uniform(-0.35, 0.35), 0.3, field_h - 0.3),
+                primary_pos[0] + attack_sign * self.rng.uniform(0.7, 1.15),
+                np.clip(0.6 * primary_pos[1] + 0.4 * goal_center[1] + self.rng.uniform(-0.35, 0.35), 0.3, field_h - 0.3),
             ], dtype=np.float32)
             return {"skill": "move", "target": forward_target}
 
         if owner_id is None:
-            if active["player_id"] == min(teammates, key=lambda player: float(np.linalg.norm(np.asarray(player["position"], dtype=np.float32) - ball)))["player_id"]:
-                if float(np.linalg.norm(my_pos - ball)) < 0.4 and ball_speed < 0.08:
-                    direct_target = goal_center + np.asarray([0.35 * attack_sign, self.rng.uniform(-0.4, 0.4)], dtype=np.float32)
-                    return {"skill": "pass", "target": direct_target}
-                return {"skill": "trap", "target": ball.copy()}
-            return {"skill": "move", "target": ball.copy()}
+            if float(np.linalg.norm(primary_pos - ball)) < 0.4 and ball_speed < 0.08:
+                direct_target = goal_center + np.asarray([0.35 * attack_sign, self.rng.uniform(-0.4, 0.4)], dtype=np.float32)
+                return {"skill": "pass", "target": direct_target}
+            return {"skill": "trap", "target": ball.copy()}
 
         if owner_id in {player["player_id"] for player in opponents}:
             ball_owner = next(player for player in opponents if player["player_id"] == owner_id)
             owner_pos = np.asarray(ball_owner["position"], dtype=np.float32)
-            intercept = 0.62 * owner_pos + 0.38 * own_goal
+            intercept = 0.62 * owner_pos + 0.38 * np.asarray([0.0 if self.team == "home" else float(goal_center[0]), goal_center[1]], dtype=np.float32)
             intercept[1] += self.rng.uniform(-0.3, 0.3)
             return {"skill": "move", "target": intercept}
 
-        if support_teammate is not None:
-            support_pos = np.asarray(support_teammate["position"], dtype=np.float32)
-            support_target = np.asarray([
-                0.55 * ball[0] + 0.45 * support_pos[0],
-                np.clip(0.6 * ball[1] + 0.4 * support_pos[1], 0.25, field_h - 0.25),
-            ], dtype=np.float32)
-            return {"skill": "move", "target": support_target}
-
         return {"skill": "move", "target": ball.copy()}
+
+    def _build_support_targets(
+        self,
+        teammates: list[Dict],
+        primary_id: str,
+        goal_center: np.ndarray,
+        own_goal: np.ndarray,
+        ball: np.ndarray,
+        attack_sign: float,
+        field_h: float,
+    ) -> Dict[str, np.ndarray]:
+        targets: Dict[str, np.ndarray] = {}
+        support_idx = 0
+        for teammate in teammates:
+            if teammate["player_id"] == primary_id:
+                continue
+            pos = np.asarray(teammate["position"], dtype=np.float32)
+            lane_y = np.clip(goal_center[1] + (-0.9 + 1.8 * support_idx), 0.35, field_h - 0.35)
+            if attack_sign > 0:
+                lane_x = max(float(ball[0]) + 1.2 + 0.3 * support_idx, pos[0])
+            else:
+                lane_x = min(float(ball[0]) - 1.2 - 0.3 * support_idx, pos[0])
+            attack_target = np.asarray([lane_x, lane_y], dtype=np.float32)
+            cover_target = 0.55 * ball + 0.45 * own_goal
+            targets[teammate["player_id"]] = 0.7 * attack_target + 0.3 * cover_target
+            support_idx += 1
+        return targets
 
     def _select_support_teammate(self, teammates: list[Dict], active_id: str, goal_center: np.ndarray) -> Dict | None:
         candidates = [player for player in teammates if player["player_id"] != active_id]
@@ -125,5 +188,5 @@ class SimpleMatchPolicy:
         self.rng = np.random.default_rng(seed)
         self._policy = ScriptedSoccerPolicy(team=team, rng=self.rng)
 
-    def __call__(self, state: Dict) -> Dict:
+    def __call__(self, state: Dict) -> Dict[str, Dict]:
         return self._policy.act(state)

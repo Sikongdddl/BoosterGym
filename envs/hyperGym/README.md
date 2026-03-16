@@ -30,7 +30,7 @@
 
 ## 动作接口
 
-当前高层动作统一为：
+当前高层动作支持两种形式：
 
 ```python
 {
@@ -38,6 +38,19 @@
     "target": np.ndarray(shape=(2,))
 }
 ```
+
+或多人版本：
+
+```python
+{
+    "home_0": {"skill": "move", "target": np.array([x0, y0], dtype=np.float32)},
+    "home_1": {"skill": "pass", "target": np.array([x1, y1], dtype=np.float32)},
+}
+```
+
+对 `away` 队同理，key 换成对应的 `away_i`。
+
+当前环境会优先按“每个球员各自一条动作”执行；如果仍传旧的 team-level 单动作，环境会自动兼容成“选一个执行球员，其余球员原地保持”。
 
 当前语义：
 
@@ -175,6 +188,7 @@ python3 scripts/render_hypergym_episode.py
 - 静止自由球附近会优先尝试 `pass`
 - 运动中的自由球会优先 `trap`
 - 有简单的射门、穿球、补位和协防逻辑
+- 现在会给队内每个球员分别输出动作，而不是整队只出一个动作
 - 支持 `1v1` 和 `2v2`
 
 它的作用主要是：

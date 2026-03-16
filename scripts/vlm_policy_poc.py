@@ -39,6 +39,11 @@ class VLMDecision:
 
 
 @dataclass
+class TeamVLMDecision:
+    players: Dict[str, VLMDecision]
+
+
+@dataclass
 class BenchmarkCase:
     case_id: str
     title: str
@@ -49,6 +54,7 @@ class BenchmarkCase:
     expected_target_note: str
     state_spec: Dict[str, Any]
     recent_events: List[Dict[str, Any]]
+    expected_player_id: str = "home_0"
     prior_action: Optional[Dict[str, Any]] = None
     prior_away_action: Optional[Dict[str, Any]] = None
     reward: float = 0.0
@@ -113,6 +119,14 @@ def _state_text_summary(state: Dict[str, Any], recent_events: List[Dict[str, Any
             name += f":{event['team']}"
         event_tokens.append(name)
     event_text = ", ".join(event_tokens) if event_tokens else "none"
+    home_layout = ", ".join(
+        f"{player['player_id']}=({float(player['position'][0]):.2f},{float(player['position'][1]):.2f})"
+        for player in home_players
+    )
+    away_layout = ", ".join(
+        f"{player['player_id']}=({float(player['position'][0]):.2f},{float(player['position'][1]):.2f})"
+        for player in away_players
+    )
 
     return (
         f"step={int(state.get('step', 0))}; "
@@ -122,6 +136,8 @@ def _state_text_summary(state: Dict[str, Any], recent_events: List[Dict[str, Any
         f"nearest_home={nearest_home_id}@{nearest_home_dist:.2f}; "
         f"nearest_away={nearest_away_id}@{nearest_away_dist:.2f}; "
         f"ball_to_opponent_goal={ball_to_opponent_goal:.2f}; "
+        f"home_players=[{home_layout}]; "
+        f"away_players=[{away_layout}]; "
         f"recent_events=[{event_text}]"
     )
 
@@ -157,13 +173,18 @@ class OpenAICompatibleVisionVLM:
 
     def decide(self, state: Dict[str, Any], state_text: str, image_path: Path) -> Dict[str, Any]:
         field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
+        home_players = [player for player in state.get("players", []) if player.get("team") == "home"]
+        player_schema = ", ".join(
+            f'"{player["player_id"]}": {{"policy_id": "<move_to_target|pass_to_target|trap_ball|dribble_to_target>", "target": [x, y], "reason": "<short_reason>"}}'
+            for player in home_players
+        )
+        home_player_ids = ", ".join(player["player_id"] for player in home_players)
         with open(image_path, "rb") as file_obj:
             image_b64 = base64.b64encode(file_obj.read()).decode("utf-8")
 
         schema_text = (
-            "Return ONLY valid JSON with keys: "
-            '{"policy_id": "<move_to_target|pass_to_target|trap_ball|dribble_to_target>", '
-            '"target": [x, y], "reason": "<short_reason>"}'
+            "Return ONLY valid JSON with this shape: "
+            '{"players": {' + player_schema + "}}"
         )
         policy_semantics = (
             "Policy semantics:\n"
@@ -179,11 +200,12 @@ class OpenAICompatibleVisionVLM:
         prompt = (
             "You are a high-level soccer tactics model for the home team.\n"
             "The image is the primary input. The text is auxiliary context.\n"
+            f"You must output one action for every home player: {home_player_ids}.\n"
             f"Field size: width={field[0]:.2f}, height={field[1]:.2f}\n"
             f"State summary: {state_text}\n"
             f"{policy_semantics}\n"
             f"{schema_text}\n"
-            "The answer must be a single JSON object and target must stay inside field bounds."
+            "The answer must be a single JSON object and every target must stay inside field bounds."
         )
 
         payload = {
@@ -249,15 +271,57 @@ class OpenAICompatibleVisionVLM:
             raise RuntimeError(f"VLM output is not valid JSON: {text_output}")
 
 
-def _parse_decision(raw: Dict[str, Any], state: Dict[str, Any], fallback_reason: str) -> VLMDecision:
+def _fallback_decision_for_player(player_id: str, state: Dict[str, Any], fallback_reason: str) -> VLMDecision:
     field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
     ball = np.asarray(state["ball_position"], dtype=np.float32)
-    default = VLMDecision(
+    goal = np.asarray([field[0], 0.5 * field[1]], dtype=np.float32)
+    home_players = [player for player in state.get("players", []) if player.get("team") == "home"]
+    player = next((item for item in home_players if item["player_id"] == player_id), None)
+    owner_id = state.get("ball_owner_id")
+    if owner_id == player_id and player is not None:
+        pos = np.asarray(player["position"], dtype=np.float32)
+        forward = pos + np.asarray([0.8, 0.0], dtype=np.float32)
+        return VLMDecision(
+            policy_id="dribble_to_target",
+            target=_clip_target(0.7 * forward + 0.3 * goal, field),
+            source="fallback",
+            reason=fallback_reason,
+        )
+    if owner_id is None:
+        nearest = None
+        nearest_dist = 999.0
+        for home_player in home_players:
+            ppos = np.asarray(home_player["position"], dtype=np.float32)
+            dist = float(np.linalg.norm(ppos - ball))
+            if dist < nearest_dist:
+                nearest = home_player
+                nearest_dist = dist
+        if nearest is not None and nearest["player_id"] == player_id:
+            return VLMDecision(
+                policy_id="trap_ball",
+                target=_clip_target(ball, field),
+                source="fallback",
+                reason=fallback_reason,
+            )
+    if player is not None:
+        return VLMDecision(
+            policy_id="move_to_target",
+            target=_clip_target(np.asarray(player["position"], dtype=np.float32), field),
+            source="fallback",
+            reason=fallback_reason,
+        )
+    return VLMDecision(
         policy_id="trap_ball",
         target=_clip_target(ball, field),
         source="fallback",
         reason=fallback_reason,
     )
+
+
+def _parse_single_decision(raw: Dict[str, Any], state: Dict[str, Any], player_id: str, fallback_reason: str) -> VLMDecision:
+    default = _fallback_decision_for_player(player_id, state, fallback_reason)
+    field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
+    ball = np.asarray(state["ball_position"], dtype=np.float32)
 
     if not isinstance(raw, dict):
         return default
@@ -289,6 +353,17 @@ def _parse_decision(raw: Dict[str, Any], state: Dict[str, Any], fallback_reason:
     return VLMDecision(policy_id=policy_id, target=parsed_target, source="vlm", reason=reason)
 
 
+def _parse_team_decision(raw: Dict[str, Any], state: Dict[str, Any], fallback_reason: str) -> TeamVLMDecision:
+    home_players = [player for player in state.get("players", []) if player.get("team") == "home"]
+    raw_players = raw.get("players", raw if isinstance(raw, dict) else {})
+    parsed: Dict[str, VLMDecision] = {}
+    for player in home_players:
+        player_id = player["player_id"]
+        player_raw = raw_players.get(player_id, {}) if isinstance(raw_players, dict) else {}
+        parsed[player_id] = _parse_single_decision(player_raw, state=state, player_id=player_id, fallback_reason=fallback_reason)
+    return TeamVLMDecision(players=parsed)
+
+
 def _decision_to_action(decision: VLMDecision) -> Dict[str, Any]:
     mapping = {
         "move_to_target": "move",
@@ -300,6 +375,13 @@ def _decision_to_action(decision: VLMDecision) -> Dict[str, Any]:
     return {
         "skill": skill,
         "target": decision.target.copy(),
+    }
+
+
+def _team_decision_to_action(team_decision: TeamVLMDecision) -> Dict[str, Any]:
+    return {
+        player_id: _decision_to_action(decision)
+        for player_id, decision in team_decision.players.items()
     }
 
 
@@ -360,8 +442,8 @@ def _query_vlm_on_record(
         raw_decision = {"error": str(exc)}
         fallback_reason = f"vlm_error:{exc}"
 
-    decision = _parse_decision(raw_decision if isinstance(raw_decision, dict) else {}, state=state, fallback_reason=fallback_reason)
-    action = _decision_to_action(decision)
+    team_decision = _parse_team_decision(raw_decision if isinstance(raw_decision, dict) else {}, state=state, fallback_reason=fallback_reason)
+    action = _team_decision_to_action(team_decision)
     artifact_paths = {"image_path": str(frame_path)}
 
     artifact_payload = {
@@ -370,10 +452,13 @@ def _query_vlm_on_record(
         "state": state,
         "raw_decision": raw_decision,
         "parsed_decision": {
-            "policy_id": decision.policy_id,
-            "target": decision.target,
-            "source": decision.source,
-            "reason": decision.reason,
+            player_id: {
+                "policy_id": decision.policy_id,
+                "target": decision.target,
+                "source": decision.source,
+                "reason": decision.reason,
+            }
+            for player_id, decision in team_decision.players.items()
         },
         "env_action": action,
         "record": record,
@@ -385,7 +470,7 @@ def _query_vlm_on_record(
 
     return {
         "raw_decision": raw_decision,
-        "decision": decision,
+        "decision": team_decision,
         "action": action,
         "artifact_paths": artifact_paths,
     }
@@ -638,9 +723,9 @@ def run_rollout(
                 artifact_dir=step_artifact_dir,
             )
 
-            decision = query["decision"]
+            team_decision = query["decision"]
             action = query["action"]
-            if decision.source != "vlm":
+            if any(decision.source != "vlm" for decision in team_decision.players.values()):
                 used_fallback_steps += 1
 
             obs, reward, done, info = simulation.step(action)
@@ -732,32 +817,47 @@ def run_benchmark(
             state_text=state_text,
             artifact_dir=artifact_dir,
         )
-        decision = query["decision"]
+        team_decision = query["decision"]
+        decision = team_decision.players[case.expected_player_id]
         target = np.asarray(decision.target, dtype=np.float32)
         policy_match = decision.policy_id in case.expected_policy_ids
         if policy_match:
             matched_count += 1
+        all_players_present = len(team_decision.players) == case.num_home and all(
+            player_id.startswith("home_") for player_id in team_decision.players
+        )
 
         summary = {
             "case_id": case.case_id,
             "title": case.title,
             "description": case.description,
+            "expected_player_id": case.expected_player_id,
             "expected_policy_ids": case.expected_policy_ids,
             "expected_target_note": case.expected_target_note,
             "state_text": state_text,
             "raw_decision": query["raw_decision"],
             "parsed_decision": {
+                player_id: {
+                    "policy_id": player_decision.policy_id,
+                    "target": [float(player_decision.target[0]), float(player_decision.target[1])],
+                    "source": player_decision.source,
+                    "reason": player_decision.reason,
+                }
+                for player_id, player_decision in team_decision.players.items()
+            },
+            "primary_player_decision": {
                 "policy_id": decision.policy_id,
                 "target": [float(target[0]), float(target[1])],
                 "source": decision.source,
                 "reason": decision.reason,
             },
             "policy_match": policy_match,
+            "all_players_present": all_players_present,
             "artifact_paths": query["artifact_paths"],
         }
         case_results.append(summary)
         print(
-            f"[PoC benchmark] case={case.case_id} policy={decision.policy_id} "
+            f"[PoC benchmark] case={case.case_id} player={case.expected_player_id} policy={decision.policy_id} "
             f"source={decision.source} match={int(policy_match)}"
         )
 

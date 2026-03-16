@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 
@@ -126,19 +126,19 @@ class HyperGymSimulation:
         state["done"] = self.step_count >= self.params.max_steps or self.winner is not None
         return state
 
-    def step(self, action: Dict, opponent_action: Dict | None = None) -> Tuple[np.ndarray, float, bool, Dict]:
+    def step(self, action: Dict[str, Any], opponent_action: Dict[str, Any] | None = None) -> Tuple[np.ndarray, float, bool, Dict]:
         self.step_count += 1
         step_events: List[Dict] = []
 
-        home_action = self._normalize_action(action, team="home")
+        home_action = self._normalize_actions(action, team="home")
         if opponent_action is None and self.opponent_policy is not None:
             opponent_action = self.opponent_policy(self.get_state())
-        away_action = self._normalize_action(opponent_action, team="away")
+        away_action = self._normalize_actions(opponent_action, team="away")
 
         self.prev_actions = dict(self.last_actions)
-        self.last_actions = {"home": home_action, "away": away_action}
-        self._apply_team_action(home_action, team="home", step_events=step_events)
-        self._apply_team_action(away_action, team="away", step_events=step_events)
+        self.last_actions = {**home_action, **away_action}
+        self._apply_team_actions(home_action, team="home", step_events=step_events)
+        self._apply_team_actions(away_action, team="away", step_events=step_events)
         self._resolve_player_collisions(step_events)
         self._resolve_ball_motion(step_events)
         self._resolve_possession(step_events)
@@ -159,7 +159,7 @@ class HyperGymSimulation:
         }
         return self.get_obs(), reward, done, info
 
-    def _normalize_action(self, action: Dict | None, team: str) -> Dict:
+    def _normalize_single_action(self, action: Dict | None, team: str) -> Dict:
         if action is None:
             return {"skill": "move", "target": self.ball.position.copy()}
 
@@ -178,39 +178,106 @@ class HyperGymSimulation:
             normalized["target"] = self.ball.position.copy()
         return normalized
 
-    def _apply_team_action(self, action: Dict, team: str, step_events: List[Dict]) -> None:
+    def _normalize_actions(self, action: Dict[str, Any] | None, team: str) -> Dict[str, Dict]:
+        teammates = [player for player in self.players if player.team == team]
+        if action is None:
+            return {
+                player.player_id: self._normalize_single_action(None, team=team)
+                for player in teammates
+            }
+
+        if "players" in action and isinstance(action["players"], dict):
+            raw_actions = action["players"]
+            normalized: Dict[str, Dict] = {}
+            for player in teammates:
+                if player.player_id in raw_actions:
+                    normalized[player.player_id] = self._normalize_single_action(raw_actions.get(player.player_id), team=team)
+                else:
+                    normalized[player.player_id] = self._idle_action(player)
+            return normalized
+
+        if any(player.player_id in action for player in teammates):
+            normalized = {}
+            for player in teammates:
+                if player.player_id in action:
+                    normalized[player.player_id] = self._normalize_single_action(action.get(player.player_id), team=team)
+                else:
+                    normalized[player.player_id] = self._idle_action(player)
+            return normalized
+
+        legacy_action = self._normalize_single_action(action, team=team)
+        active_player = self._select_legacy_executor(team=team, action=legacy_action)
+        normalized = {}
+        for player in teammates:
+            if active_player is not None and player.player_id == active_player.player_id:
+                normalized[player.player_id] = legacy_action
+            else:
+                normalized[player.player_id] = {
+                    "skill": "move",
+                    "target": player.position.copy(),
+                }
+        return normalized
+
+    def _idle_action(self, player: Player) -> Dict:
+        return {
+            "skill": "move",
+            "target": player.position.copy(),
+        }
+
+    def _select_legacy_executor(self, team: str, action: Dict) -> Player | None:
         skill = action.get("skill", "move")
         target = self._clip_target(np.asarray(action.get("target", self.ball.position), dtype=np.float32))
         owner = self._ball_owner()
         team_owner = owner if owner is not None and owner.team == team else None
 
+        if skill == "pass":
+            return team_owner or self._nearest_player(self.ball.position, team=team)
+        if skill == "dribble":
+            return team_owner or self._nearest_player(self.ball.position, team=team)
+        if skill == "trap":
+            return self._nearest_player(target, team=team)
+        return team_owner or self._nearest_player(target, team=team)
+
+    def _apply_team_actions(self, actions: Dict[str, Dict], team: str, step_events: List[Dict]) -> None:
+        teammates = [player for player in self.players if player.team == team]
+        for player in teammates:
+            action = actions.get(player.player_id)
+            if action is None:
+                continue
+            self._apply_player_action(player, action, step_events)
+
+    def _apply_player_action(self, actor: Player, action: Dict, step_events: List[Dict]) -> None:
+        skill = action.get("skill", "move")
+        target = self._clip_target(np.asarray(action.get("target", self.ball.position), dtype=np.float32))
+        team = actor.team
+        owner = self._ball_owner()
+
         if skill == "dribble" and not self.params.enable_dribble:
             skill = "move"
 
         if skill == "pass":
-            kicker = team_owner or self._nearest_player(self.ball.position, team=team)
-            if kicker is None or kicker.distance_to(self.ball.position) > self._ball_interaction_radius(self.params.pass_kick_radius):
+            if actor.distance_to(self.ball.position) > self._ball_interaction_radius(self.params.pass_kick_radius):
                 return
-            kicker.has_ball = False
-            if self._should_lose_ball(kicker, team, action_type="pass", step_events=step_events):
-                self._apply_loose_ball(kicker, target, team, step_events)
+            actor.has_ball = False
+            if owner is not None and owner.player_id == actor.player_id:
+                self.ball.owner_id = None
+            if self._should_lose_ball(actor, action_type="pass", step_events=step_events):
+                self._apply_loose_ball(actor, target, team, step_events)
             else:
                 self.ball.release_towards(target, self.params.ball_speed)
                 step_events.append({
                     "event_type": "pass_started",
                     "team": team,
-                    "from": kicker.player_id,
+                    "from": actor.player_id,
                     "target": target.copy(),
                 })
             return
 
         if skill == "dribble":
-            actor = team_owner or self._nearest_player(self.ball.position, team=team)
-            if actor is None:
-                return
-            if team_owner is None:
+            if owner is None or owner.player_id != actor.player_id:
                 actor.move_towards(self.ball.position)
                 actor.clamp(self.params.field_size)
+                step_events.append({"event_type": "move", "team": team, "by": actor.player_id, "target": self.ball.position.copy()})
                 return
             actor.move_towards(target, speed_scale=self.params.dribble_speed / max(actor.max_speed, 1e-6))
             actor.clamp(self.params.field_size)
@@ -219,14 +286,11 @@ class HyperGymSimulation:
             return
 
         if skill == "trap":
-            trapper = self._nearest_player(target, team=team)
-            if trapper is None:
-                return
-            trapper.move_towards(target)
-            trapper.clamp(self.params.field_size)
-            if self.ball.owner_id is None and trapper.distance_to(self.ball.position) <= self._ball_interaction_radius(self.params.trap_radius):
-                if self._should_lose_ball(trapper, team, action_type="trap", step_events=step_events):
-                    self._apply_loose_ball(trapper, self.ball.position.copy(), team, step_events)
+            actor.move_towards(target)
+            actor.clamp(self.params.field_size)
+            if self.ball.owner_id is None and actor.distance_to(self.ball.position) <= self._ball_interaction_radius(self.params.trap_radius):
+                if self._should_lose_ball(actor, action_type="trap", step_events=step_events):
+                    self._apply_loose_ball(actor, self.ball.position.copy(), team, step_events)
                 else:
                     self.ball.velocity = self.ball.velocity * self.params.trap_velocity_scale
                     speed = float(np.linalg.norm(self.ball.velocity))
@@ -235,19 +299,18 @@ class HyperGymSimulation:
                     step_events.append({
                         "event_type": "trap_completed",
                         "team": team,
-                        "by": trapper.player_id,
+                        "by": actor.player_id,
                         "ball_speed": float(np.linalg.norm(self.ball.velocity)),
                     })
             else:
-                step_events.append({"event_type": "trap_attempt", "team": team, "by": trapper.player_id, "target": target.copy()})
+                step_events.append({"event_type": "trap_attempt", "team": team, "by": actor.player_id, "target": target.copy()})
             return
 
-        mover = team_owner or self._nearest_player(target, team=team)
-        if mover is None:
-            return
-        mover.move_towards(target)
-        mover.clamp(self.params.field_size)
-        step_events.append({"event_type": "move", "team": team, "by": mover.player_id, "target": target.copy()})
+        actor.move_towards(target)
+        actor.clamp(self.params.field_size)
+        if owner is not None and owner.player_id == actor.player_id:
+            self.ball.attach_to(actor.player_id, actor.position)
+        step_events.append({"event_type": "move", "team": team, "by": actor.player_id, "target": target.copy()})
 
     def _resolve_ball_motion(self, step_events: List[Dict]) -> None:
         owner = self._ball_owner()
@@ -418,8 +481,9 @@ class HyperGymSimulation:
 
             step_events.append({"event_type": "ball_player_collision", "player": player.player_id})
 
-    def _should_lose_ball(self, actor: Player, team: str, action_type: str, step_events: List[Dict]) -> bool:
+    def _should_lose_ball(self, actor: Player, action_type: str, step_events: List[Dict]) -> bool:
         risk = 0.0
+        team = actor.team
         opponents = [player for player in self.players if player.team != team]
         nearest_opp_dist = min((player.distance_to(self.ball.position) for player in opponents), default=999.0)
         if nearest_opp_dist < self.params.contest_radius:
@@ -430,7 +494,7 @@ class HyperGymSimulation:
         if ball_speed > safe_speed:
             risk += self.params.unstable_ball_speed_penalty
 
-        last_action = self.prev_actions.get(team, {})
+        last_action = self.prev_actions.get(actor.player_id, {})
         if last_action and last_action.get("skill") not in {action_type, "move"}:
             risk += self.params.unstable_action_switch_penalty
 

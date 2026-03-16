@@ -111,6 +111,15 @@ def _to_pixels(position: np.ndarray, field_size: Tuple[float, float], field_box:
 def _format_action(action: Dict | None) -> str:
     if not action:
         return "reset"
+    if "players" in action:
+        action = action["players"]
+    if any(isinstance(value, dict) and "skill" in value for value in action.values()):
+        parts: List[str] = []
+        for player_id, player_action in action.items():
+            skill = player_action.get("skill", player_action.get("type", "move"))
+            target = np.asarray(player_action.get("target", [0.0, 0.0]), dtype=np.float32)
+            parts.append(f"{player_id}:{skill}({target[0]:.2f},{target[1]:.2f})")
+        return " | ".join(parts)
     skill = action.get("skill", action.get("type", "move"))
     target = np.asarray(action.get("target", [0.0, 0.0]), dtype=np.float32)
     return f"{skill} -> ({target[0]:.2f}, {target[1]:.2f})"
