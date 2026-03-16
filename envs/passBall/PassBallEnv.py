@@ -108,7 +108,7 @@ class PassBallEnv:
                     found = True
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
-    
+    # 根据权重调整采样策略
     def on_episode_end(self, success: bool, episode_idx: int) -> Tuple[float, float, bool, Dict]:
         """
         新课程学习入口：每个 episode 结束时调用。
@@ -231,13 +231,13 @@ class PassBallEnv:
 
     def compute_midlevel_reward(self):
         """
-        passBall 任务的高层奖励（新版，事件驱动）：
+        passBall 任务的高层奖励（重构版）：
 
-        1) 触球前：用一个很小的 shaping 奖励机器人移动方向对齐 球->target
-        2) 首次触球：给一个很大的一次性奖励
-        3) 成功（球进入 target 邻域）：给更大的终止奖励
-        4) 时间惩罚 + 摔倒惩罚
-        5) 其它几何量（球速方向、距离等）只做 logging，不进 reward
+        1) 触球前：重点鼓励“接近球 + 站到球后方 + 朝球接近”
+        2) 首次有效触球：给中等事件奖励，避免“只要碰到就赚”
+        3) 触球后：持续鼓励“球朝 target 飞 + 球离 target 更近”
+        4) 成功（球进入 target 邻域）：给大额终止奖励
+        5) 时间惩罚 + 摔倒惩罚
         """
         device = self.controller.device
         dtype  = self.base_pos.dtype
@@ -327,9 +327,9 @@ class PassBallEnv:
         if valid_hit_now:
             self._has_touched_ball = True
 
-        # 大额触球奖励
+        # 中等触球奖励：保留探索信号，但不再主导优化目标
         r_touch = torch.tensor(
-            20.0 if first_touch else 0.0,
+            8.0 if first_touch else 0.0,
             device=device, dtype=dtype
         )
 
@@ -349,39 +349,56 @@ class PassBallEnv:
             dtype=dtype,
         )
 
+        prev_ball_dist = getattr(self, "_prev_ball_dist", None)
+        if prev_ball_dist is None:
+            ball_progress = torch.zeros((), device=device, dtype=dtype)
+        else:
+            ball_progress = torch.clamp(prev_ball_dist - ball_dist, min=-0.30, max=0.30)
+
         # ========== 7. 合成总奖励 ==========
-        # 机器人方向 shaping：仅在“尚未触球”阶段生效
+        # 触球前：重点学“接近球 + 站位 + 朝球接近”
         if not prev_touched:
-            # 降低纯“朝 target 方向移动”的权重，减少绕球刷分
-            r_robot = 0.15 * robot_align_reward
-            # 新增：鼓励机器人-球-target 共线，且球在中间
-            r_line = 0.60 * line_reward * line_dist_gate
-            # 强化“接近球”行为
-            r_near_ball = 0.35 * torch.exp(-robot_to_ball_dist / 0.9)
-            # >5m 进入硬禁区：指数级巨额惩罚，强制禁止远离球
-            far_excess = torch.relu(robot_to_ball_dist - 5.0)
-            far_penalty = 30.0 * (torch.exp(2.0 * far_excess) - 1.0)
+            r_robot = 0.05 * robot_align_reward
+            r_approach = 0.45 * approach_reward
+            r_line = 0.45 * line_reward * line_dist_gate
+            r_near_ball = 0.50 * torch.exp(-robot_to_ball_dist / 0.8)
+            r_post_align = torch.zeros((), device=device, dtype=dtype)
+            r_post_dist = torch.zeros((), device=device, dtype=dtype)
+            r_progress = torch.zeros((), device=device, dtype=dtype)
+            # 更早抑制明显跑偏
+            far_excess = torch.relu(robot_to_ball_dist - 3.0)
+            far_penalty = 12.0 * (torch.exp(1.4 * far_excess) - 1.0)
             # 反作弊：如果“朝 target 对齐”高，但“朝球接近”差，则惩罚
             hack_gap = torch.relu(robot_align_reward - approach_reward)
-            hack_penalty = 0.35 * hack_gap + 0.15 * tangentiality * robot_align_reward
+            hack_penalty = 0.45 * hack_gap + 0.20 * tangentiality * robot_align_reward
         else:
             r_robot = torch.zeros((), device=device, dtype=dtype)
+            r_approach = torch.zeros((), device=device, dtype=dtype)
             r_line = torch.zeros((), device=device, dtype=dtype)
             r_near_ball = torch.zeros((), device=device, dtype=dtype)
+            # 触球后持续约束球路质量，而不是只靠一次性事件奖励
+            speed_gate = torch.tanh(ball_speed / 1.5)
+            r_post_align = 1.20 * ball_align_reward * speed_gate
+            r_post_dist = 0.80 * torch.exp(-ball_dist / 0.9)
+            r_progress = 4.00 * ball_progress
             far_penalty = torch.zeros((), device=device, dtype=dtype)
             hack_penalty = torch.zeros((), device=device, dtype=dtype)
 
-        # 球速幅值奖励：重点鼓励“首次触球时”的初速度
+        # 首次触球时，轻度鼓励把球真正打起来
         if first_touch:
-            r_ball = 2.0 * torch.tanh(ball_speed / 2.0)
+            r_ball = 1.20 * torch.tanh(ball_speed / 2.0)
         else:
             r_ball = torch.zeros((), device=device, dtype=dtype)
 
         reward = (
             r_robot   # 机器人速度方向奖励
+            + r_approach  # 朝球接近奖励
             + r_line  # 三点共线奖励
             + r_near_ball  # 接近球奖励
             + r_ball  # 球速度方向奖励
+            + r_post_align  # 触球后球路朝向奖励
+            + r_post_dist  # 触球后球离目标的密集奖励
+            + r_progress  # 触球后球朝目标收敛的进步奖励
             + r_touch # 一次性触球大额奖励
             + r_succ  # 成功奖励
             - far_penalty  # 远离球硬惩罚
@@ -415,9 +432,13 @@ class PassBallEnv:
 
         # 子 reward 分量
         terms["r_robot"] = r_robot.detach()
+        terms["r_approach"] = r_approach.detach()
         terms["r_line"]  = r_line.detach()
         terms["r_near_ball"] = r_near_ball.detach()
         terms["r_ball"]  = r_ball.detach()
+        terms["r_post_align"] = r_post_align.detach()
+        terms["r_post_dist"] = r_post_dist.detach()
+        terms["r_progress"] = r_progress.detach()
         terms["r_touch"] = r_touch.detach()
         terms["r_succ"]  = r_succ.detach()
         terms["far_penalty"]    = (-far_penalty).detach()
@@ -440,6 +461,7 @@ class PassBallEnv:
         self.extras["success"] = success
         self.extras["hit"] = bool(first_touch)
         self._prev_ball_speed = ball_speed.detach()
+        self._prev_ball_dist = ball_dist.detach()
 
         # ========== 9. 终端 debug 输出 ==========
         debug_flag = getattr(self, "debug_reward", False)
@@ -452,8 +474,12 @@ class PassBallEnv:
                 f"ball_speed={float(ball_speed):.3f}, "
                 f"ball_align={float(ball_align_reward):.3f}, "
                 f"r_robot={float(r_robot):.3f}, "
+                f"r_approach={float(r_approach):.3f}, "
                 f"r_line={float(r_line):.3f}, "
                 f"r_near_ball={float(r_near_ball):.3f}, "
+                f"r_post_align={float(r_post_align):.3f}, "
+                f"r_post_dist={float(r_post_dist):.3f}, "
+                f"r_progress={float(r_progress):.3f}, "
                 f"far_penalty={float(far_penalty):.3f}, "
                 f"hack_penalty={float(hack_penalty):.3f}, "
                 f"r_touch={float(r_touch):.1f}, "
@@ -640,6 +666,10 @@ class PassBallEnv:
         return float(dist_xy.item())
     
     def get_initial_dist_xy(self):
+        # 首个 episode 或重置边界时，initial_dist_xy 可能尚未写入。
+        # 回退到当前实时距离，避免上层采样/日志崩溃。
+        if self.initial_dist_xy is None:
+            return float(self.get_dist_xy())
         return float(self.initial_dist_xy)
 
     def step(self, actions):
@@ -771,12 +801,7 @@ class PassBallEnv:
             approach_cos = torch.tensor(0.0, device=device, dtype=dtype)
             approach_reward = torch.tensor(0.0, device=device, dtype=dtype)
             tangentiality = torch.tensor(0.0, device=device, dtype=dtype)
-        # 3. 触球检测
-        delta_br = ball_xy - robot_pos
-        ball_to_robot = torch.norm(delta_br)
-        touch_radius = 0.4
-        touch_now = ball_to_robot < touch_radius
-        # HER时无法判断是否首次触球，统一不给r_touch
+        # 3. HER时无法可靠恢复触球事件，统一不给事件奖励
         r_touch = torch.tensor(0.0, device=device, dtype=dtype)
         # 4. 成功判定
         success_thresh = 0.60
@@ -790,20 +815,28 @@ class PassBallEnv:
         # 5. 时间/摔倒惩罚
         time_penalty = torch.tensor(0.01, device=device, dtype=dtype)
         fallen_penalty = torch.tensor(0.0, device=device, dtype=dtype)  # HER无法判断
-        # 6. shaping
-        r_robot = 0.15 * robot_align_reward
-        r_line = 0.60 * line_reward * line_dist_gate
-        r_near_ball = 0.35 * torch.exp(-robot_to_ball_dist / 0.9)
-        far_excess = torch.relu(robot_to_ball_dist - 5.0)
-        far_penalty = 30.0 * (torch.exp(2.0 * far_excess) - 1.0)
+        # 6. shaping：HER 与主 reward 保持同一倾向，但不依赖事件历史
+        r_robot = 0.05 * robot_align_reward
+        r_approach = 0.45 * approach_reward
+        r_line = 0.45 * line_reward * line_dist_gate
+        r_near_ball = 0.50 * torch.exp(-robot_to_ball_dist / 0.8)
+        r_post_align = torch.zeros((), device=device, dtype=dtype)
+        r_post_dist = 0.80 * torch.exp(-ball_dist / 0.9)
+        r_progress = torch.zeros((), device=device, dtype=dtype)
+        far_excess = torch.relu(robot_to_ball_dist - 3.0)
+        far_penalty = 12.0 * (torch.exp(1.4 * far_excess) - 1.0)
         hack_gap = torch.relu(robot_align_reward - approach_reward)
-        hack_penalty = 0.35 * hack_gap + 0.15 * tangentiality * robot_align_reward
+        hack_penalty = 0.45 * hack_gap + 0.20 * tangentiality * robot_align_reward
         r_ball = torch.zeros((), device=device, dtype=dtype)
         reward = (
             r_robot
+            + r_approach
             + r_line
             + r_near_ball
             + r_ball
+            + r_post_align
+            + r_post_dist
+            + r_progress
             + r_touch
             + r_succ
             - far_penalty

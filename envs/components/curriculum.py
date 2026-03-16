@@ -6,10 +6,13 @@ DEFAULT_CFG = {
     # 初始窗口
     "r_min": 1.0,
     "r_max": 1.5,
+    "warmup_episodes": 0,
+    "warmup_r_min": None,
+    "warmup_r_max": None,
 
     # 上/下调 r_max 的最大步长（实际会按比例缩放）
-    "inc": 0.3,
-    "dec": 0.2,
+    "inc": 0.15,
+    "dec": 0.08,
 
     # 边界
     "r_max_cap": 15.0,
@@ -19,6 +22,9 @@ DEFAULT_CFG = {
     "high_thresh": 0.6,       # 全局窗口升难阈值
     "low_thresh": 0.3,        # 降难辅助阈值
     "high_thresh_curr": 0.6,  # 当前级别升难阈值（同级验证）
+    "use_target_success": False,
+    "target_success": 0.55,
+    "target_tolerance": 0.05,
 
     # —— 滑窗大小 ——（全局窗口与你此前逻辑一致）
     "window_global": 50,      # 全局滑窗大小
@@ -50,9 +56,23 @@ class CurriculumPolicy:
             cfg.update(cfg_dict)
         self.cfg: Dict = cfg
 
+        # 课程主阶段窗口
+        self.base_r_min: float = float(cfg.get("r_min", DEFAULT_CFG["r_min"]))
+        self.base_r_max: float = float(cfg.get("r_max", DEFAULT_CFG["r_max"]))
+        self.warmup_episodes: int = int(cfg.get("warmup_episodes", DEFAULT_CFG["warmup_episodes"]))
+        warmup_r_min = cfg.get("warmup_r_min", None)
+        warmup_r_max = cfg.get("warmup_r_max", None)
+        self.warmup_r_min: float = float(self.base_r_min if warmup_r_min is None else warmup_r_min)
+        self.warmup_r_max: float = float(self.base_r_max if warmup_r_max is None else warmup_r_max)
+        self._warmup_done: bool = self.warmup_episodes <= 0
+
         # 当前窗口
-        self.r_min: float = float(cfg.get("r_min", DEFAULT_CFG["r_min"]))
-        self.r_max: float = float(cfg.get("r_max", DEFAULT_CFG["r_max"]))
+        if self._warmup_done:
+            self.r_min = float(self.base_r_min)
+            self.r_max = float(self.base_r_max)
+        else:
+            self.r_min = float(self.warmup_r_min)
+            self.r_max = float(self.warmup_r_max)
 
         # 统计（两条滑窗：全局 / 当前级别）
         self._succ_hist_global: Deque[int] = deque(maxlen=int(cfg.get("window_global", 50)))
@@ -135,6 +155,9 @@ class CurriculumPolicy:
         high_g = float(self.cfg.get("high_thresh", DEFAULT_CFG["high_thresh"]))
         high_c = float(self.cfg.get("high_thresh_curr", DEFAULT_CFG["high_thresh"]))
         low_g = float(self.cfg.get("low_thresh", DEFAULT_CFG["low_thresh"]))
+        use_target = bool(self.cfg.get("use_target_success", DEFAULT_CFG["use_target_success"]))
+        target = float(self.cfg.get("target_success", DEFAULT_CFG["target_success"]))
+        tol = float(self.cfg.get("target_tolerance", DEFAULT_CFG["target_tolerance"]))
 
         inc_max = float(self.cfg.get("inc", DEFAULT_CFG["inc"]))
         dec_max = float(self.cfg.get("dec", DEFAULT_CFG["dec"]))
@@ -150,8 +173,58 @@ class CurriculumPolicy:
         changed = False
         reason: Optional[str] = None
 
+        # ===== Warmup：前期固定低难度，不进行课程更新 =====
+        if not self._warmup_done:
+            info = {
+                "rate_global": float(rate_g),
+                "rate_curr": float(rate_c),
+                "episodes_at_level": int(self._episodes_at_level),
+                "successes_at_level": int(self._successes_at_level),
+                "changed": False,
+                "reason": "warmup",
+                "phase": "warmup",
+                "r_min": float(self.r_min),
+                "r_max": float(self.r_max),
+            }
+            if (episode_idx + 1) >= self.warmup_episodes:
+                self._warmup_done = True
+                self.r_min = float(self.base_r_min)
+                self.r_max = float(self.base_r_max)
+                self._reset_stats(reset_global=True)
+                self._last_change_ep = int(episode_idx)
+                info.update({
+                    "changed": True,
+                    "reason": "warmup-end",
+                    "phase": "main",
+                    "r_min": float(self.r_min),
+                    "r_max": float(self.r_max),
+                })
+                return float(self.r_min), float(self.r_max), True, info
+            return float(self.r_min), float(self.r_max), False, info
+
+        # ===== 可选：按目标成功率稳态调节（围绕 target_success） =====
+        if use_target and can_change:
+            upper = min(0.999, target + tol)
+            lower = max(0.001, target - tol)
+            if rate_c > upper:
+                frac = min(1.0, max(0.0, (rate_c - upper) / max(1e-6, 1.0 - upper)))
+                delta = inc_max * frac
+                if delta > 0:
+                    self.r_max = min(self.r_max + delta, cap)
+                    changed = True
+                    reason = f"target-up:{delta:.3f} (rc={rate_c:.3f}, target={target:.3f})"
+                    self._after_change(episode_idx)
+            elif rate_c < lower:
+                frac = min(1.0, max(0.0, (lower - rate_c) / max(1e-6, lower)))
+                delta = dec_max * frac
+                if delta > 0:
+                    self.r_max = max(self.r_max - delta, floor)
+                    changed = True
+                    reason = f"target-down:{delta:.3f} (rc={rate_c:.3f}, target={target:.3f})"
+                    self._after_change(episode_idx)
+
         # ===== 升难：同级验证 + 最小驻留 + 冷却 =====
-        if (not changed) and can_change and (rate_g > high_g) and (rate_c > high_c) \
+        if (not use_target) and (not changed) and can_change and (rate_g > high_g) and (rate_c > high_c) \
                 and (self._episodes_at_level >= min_epi) and (self._successes_at_level >= min_succ):
             # 比例化上调：超过阈值越多，增量越接近 inc_max（但不超过）
             frac_g = min(1.0, max(0.0, (rate_g - high_g) / max(1e-6, 1 - high_g)))
@@ -165,7 +238,7 @@ class CurriculumPolicy:
                 self._after_change(episode_idx)
 
         # ===== 降难：防“卡死” =====
-        if (not changed) and can_change:
+        if (not use_target) and (not changed) and can_change:
             should_drop = False
             # 规则1：当前级别窗口已满仍很差
             if (len(self._succ_hist_curr) == self._succ_hist_curr.maxlen) and (rate_c < low_g):
@@ -200,10 +273,16 @@ class CurriculumPolicy:
     def _after_change(self, episode_idx: int):
         """变更难度后，重置当前级别窗口与计数，防止旧成绩推动新难度连跳。"""
         self._last_change_ep = int(episode_idx)
+        self._reset_stats(reset_global=False)
+
+    def _reset_stats(self, reset_global: bool):
         self._succ_hist_curr.clear()
         self._episodes_at_level = 0
         self._successes_at_level = 0
-        self._ema_curr = None  # 当前级别 EMA 也重置
+        self._ema_curr = None
+        if reset_global:
+            self._succ_hist_global.clear()
+            self._ema_global = None
 
     # ---- 只读接口 ----
     def get_window(self) -> Tuple[float, float]:
@@ -213,8 +292,11 @@ class CurriculumPolicy:
         """导出当前状态（便于日志/保存）。"""
         return {
             "cfg": dict(self.cfg),
+            "base_r_min": float(self.base_r_min),
+            "base_r_max": float(self.base_r_max),
             "r_min": float(self.r_min),
             "r_max": float(self.r_max),
+            "warmup_done": bool(self._warmup_done),
             "episodes_at_level": int(self._episodes_at_level),
             "successes_at_level": int(self._successes_at_level),
             "last_change_ep": int(self._last_change_ep),
@@ -229,8 +311,11 @@ class CurriculumPolicy:
         if not isinstance(state, dict):
             return
         self.cfg.update(state.get("cfg", {}))
+        self.base_r_min = float(state.get("base_r_min", self.base_r_min))
+        self.base_r_max = float(state.get("base_r_max", self.base_r_max))
         self.r_min = float(state.get("r_min", self.r_min))
         self.r_max = float(state.get("r_max", self.r_max))
+        self._warmup_done = bool(state.get("warmup_done", self._warmup_done))
         self._episodes_at_level = int(state.get("episodes_at_level", 0))
         self._successes_at_level = int(state.get("successes_at_level", 0))
         self._last_change_ep = int(state.get("last_change_ep", -10**9))

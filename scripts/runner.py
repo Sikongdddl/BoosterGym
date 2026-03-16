@@ -109,7 +109,9 @@ class Runner:
         # 2) 方向：先控制在前方 ±30° 内（后面可以做成 curriculum）
         # 这里假设 +x 是机器人“朝前”的世界系方向
         THETA_MAX = np.deg2rad(30.0)   # 30 度
-        theta = np.random.uniform(-THETA_MAX, THETA_MAX)
+
+        theta= np.random.uniform(-THETA_MAX, THETA_MAX)
+    
         dir_x = np.cos(theta)
         dir_y = np.sin(theta)
 
@@ -141,6 +143,7 @@ class Runner:
             action_dim = 3
             # 从 cfg 读高层命令的物理范围；提供安全缺省
             cmd_cfg = self.env.controller.cfg.get("commands", {})
+            curr_cfg = self.env.controller.cfg.get("curriculum", {})
             vx_range = np.array([0.0, 0.6], dtype=np.float32)  # 允许只前进：min=0.0
             vy_range = np.array([-0.35, 0.35], dtype=np.float32)
             yaw_range = np.array([-1.0, 1.0], dtype=np.float32)
@@ -159,6 +162,11 @@ class Runner:
                 gamma=0.90,
                 tau=0.005,
                 alpha=None,  # 自动温度
+                sample_sigma=float(curr_cfg.get("sample_sigma", 0.2)),
+                sample_epsilon=float(curr_cfg.get("sample_epsilon", 0.1)),
+                sample_success_bonus=float(curr_cfg.get("sample_success_bonus", 1.2)),
+                sample_hard_focus=float(curr_cfg.get("sample_hard_focus", 0.0)),
+                sample_rmax_ema_beta=float(curr_cfg.get("sample_rmax_ema_beta", 0.9)),
             )
             action_mode = "continuous"
         else:
@@ -597,6 +605,8 @@ class Runner:
 
                 # 经验入池，带 note
                 note = "after hit" if hit_happened else "before hit"
+                curr_difficulty = float(self.env.get_initial_dist_xy())
+                curr_success = bool(success_happened and not fall_happened)
                 _t_push = time.perf_counter()
                 if mode == "discrete":
                     agent.replay_buffer.push(
@@ -606,6 +616,8 @@ class Runner:
                         next_obs_high_np,
                         done_high,
                         note=note,
+                        difficulty=curr_difficulty,
+                        success=curr_success,
                     )
                 else:
                     agent.replay_buffer.push(
@@ -615,6 +627,8 @@ class Runner:
                         next_obs_high_np,
                         done_high,
                         note=note,
+                        difficulty=curr_difficulty,
+                        success=curr_success,
                     )
                 # before hit transition 单独记录，供“成功回溯加奖”和 HER 采样
                 if note == "before hit":
@@ -655,9 +669,13 @@ class Runner:
                             "approach_cos",
                             "approach_reward",
                             "r_robot",
+                            "r_approach",
                             "r_line",
                             "r_near_ball",
                             "r_ball",
+                            "r_post_align",
+                            "r_post_dist",
+                            "r_progress",
                             "r_touch",
                             "r_succ",
                             "far_penalty",
@@ -737,7 +755,7 @@ class Runner:
                         last_idx = before_hit_indices[-1]
                         if 0 <= last_idx < len(agent.replay_buffer.buf):
                             transition = agent.replay_buffer.buf[last_idx]
-                            # transition 结构: (s, a, r, s2, d, note)
+                            # transition 结构: (s, a, r, s2, d, note, difficulty, success)
                             old_r = transition[2]
                             new_r = old_r + 80.0  # r_succ=80.0
                             transition = transition[:2] + (new_r,) + transition[3:]
@@ -769,8 +787,8 @@ class Runner:
                                 print(f"[HER] skip invalid idx {buf_idx} (buf_size={buf_size})")
                                 continue
 
-                            # 结构: (s, a, r, s2, d, note)
-                            obs, act, rew, next_obs, done, note = agent.replay_buffer.buf[buf_idx]
+                            # 结构: (s, a, r, s2, d, note, difficulty, success)
+                            obs, act, rew, next_obs, done, note, difficulty, success = agent.replay_buffer.buf[buf_idx]
 
                             # 基于虚拟 goal 修改观测
                             obs_her = obs.copy()
@@ -799,6 +817,8 @@ class Runner:
                                 next_obs_her,
                                 done_her,
                                 note=note_her,
+                                difficulty=difficulty,
+                                success=False,
                             )
                             added += 1
 

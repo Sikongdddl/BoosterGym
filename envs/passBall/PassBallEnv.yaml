@@ -279,6 +279,9 @@ rewards:
 curriculum:
   r_min: 0.6
   r_max: 1.0
+  warmup_episodes: 800
+  warmup_r_min: 0.35
+  warmup_r_max: 0.70
   inc: 0.3
   dec: 0.2
   r_max_cap: 15.0
@@ -286,10 +289,14 @@ curriculum:
   high_thresh: 0.7
   high_thresh_curr: 0.7
   low_thresh: 0.5
+  use_target_success: false
+  target_success: 0.55
+  target_tolerance: 0.05
   min_episodes_at_level: 50
   min_successes_at_level: 35
   cooldown_episodes: 15
   sample_sigma: 0.35
   sample_epsilon: 0.20
   sample_success_bonus: 1.6
+  sample_hard_focus: 0.2
   sample_rmax_ema_beta: 0.97

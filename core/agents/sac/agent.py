@@ -19,11 +19,22 @@ class SACAgent(BaseAgent):
                  target_entropy=None,        # 默认为 -action_dim
                  batch_size=256,
                  buffer_capacity=200000,
-                 action_low=None, action_high=None):  # 连续动作的物理范围（numpy 形状[action_dim]）
+                 action_low=None, action_high=None,
+                 sample_sigma=0.2,
+                 sample_epsilon=0.1,
+                 sample_success_bonus=1.2,
+                 sample_hard_focus=0.0,
+                 sample_rmax_ema_beta=0.9):  # 连续动作的物理范围（numpy 形状[action_dim]）
         self.device = device
         self.gamma = gamma
         self.tau = tau
         self.batch_size = batch_size
+        self.sample_sigma = float(sample_sigma)
+        self.sample_epsilon = float(sample_epsilon)
+        self.sample_success_bonus = float(sample_success_bonus)
+        self.sample_hard_focus = float(sample_hard_focus)
+        self.sample_rmax_ema_beta = float(sample_rmax_ema_beta)
+        self.sample_rmax = None
 
         self.policy = GaussianPolicy(state_dim, action_dim).to(device)
         self.q1 = QNetwork(state_dim, action_dim).to(device)
@@ -72,11 +83,32 @@ class SACAgent(BaseAgent):
     def push(self, *args):
         self.replay_buffer.push(*args)
 
-    def update(self):
+    def update(self, r_min=None, r_max=None):
         if len(self.replay_buffer) < self.batch_size:
             return False, None
 
-        s, a, r, s2, d, notes = self.replay_buffer.sample(self.batch_size)
+        sample_r_min = r_min
+        sample_r_max = r_max
+        if (r_min is not None) and (r_max is not None):
+            width = max(0.0, float(r_max) - float(r_min))
+            cur_r_max = float(r_max)
+            if self.sample_rmax is None:
+                self.sample_rmax = cur_r_max
+            else:
+                beta = self.sample_rmax_ema_beta
+                self.sample_rmax = beta * self.sample_rmax + (1.0 - beta) * cur_r_max
+            sample_r_max = self.sample_rmax
+            sample_r_min = sample_r_max - width
+
+        s, a, r, s2, d, notes, difficulties, successes = self.replay_buffer.sample(
+            self.batch_size,
+            r_min=sample_r_min,
+            r_max=sample_r_max,
+            sigma=self.sample_sigma,
+            epsilon=self.sample_epsilon,
+            success_bonus=self.sample_success_bonus,
+            hard_focus=self.sample_hard_focus,
+        )
         s   = torch.as_tensor(s, dtype=torch.float32, device=self.device)
         a   = torch.as_tensor(a, dtype=torch.float32, device=self.device)
         r   = torch.as_tensor(r, dtype=torch.float32, device=self.device).unsqueeze(1)
@@ -95,6 +127,7 @@ class SACAgent(BaseAgent):
             alpha = self.log_alpha.exp().detach()
         else:
             alpha = torch.tensor(self.alpha, device=self.device)
+            alpha_loss = torch.tensor(0.0, device=self.device)
 
         # ---- 目标 Q ----
         with torch.no_grad():
@@ -157,4 +190,3 @@ class SACAgent(BaseAgent):
         if "q2_target" in ckpt: self.q2_target.load_state_dict(ckpt["q2_target"])
         if "log_alpha" in ckpt and hasattr(self, "log_alpha"):
             self.log_alpha.data.copy_(ckpt["log_alpha"].to(self.device))
-
