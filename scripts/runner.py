@@ -1127,3 +1127,97 @@ class Runner:
 
         finally:
             tb.close()
+
+    def boosterT12v2(self):
+        """
+        Minimal inference-first runner for the new 2v2 Booster T1 IsaacGym env.
+        It reuses the existing single-robot low-level policy in batched mode.
+        """
+        obs, infos = self.env.reset()
+        obs = obs.to(self.device)
+        zero_cmd = self.env.get_high_level_action_space()
+        self.env.apply_high_level_command(zero_cmd)
+        max_steps = int(self.cfg.get("game", {}).get("episode_length_steps", 1000))
+
+        for step_idx in range(max_steps):
+            with torch.no_grad():
+                obs_mod = obs.clone()
+                obs_mod[:, 6] = self.env.commands[:, 0]
+                obs_mod[:, 7] = self.env.commands[:, 1]
+                obs_mod[:, 8] = self.env.commands[:, 2]
+                dist = self.model.act(obs_mod)
+                act = dist.loc
+                obs, rew, done, infos = self.env.step(act)
+                obs = obs.to(self.device)
+
+            if step_idx % 100 == 0:
+                ball = infos["ball_state"]["pos"]
+                print(
+                    f"[boosterT12v2] step={step_idx} "
+                    f"ball=({float(ball[0]):.2f}, {float(ball[1]):.2f}, {float(ball[2]):.2f})"
+                )
+
+            if torch.any(done).item():
+                print(f"[boosterT12v2] episode finished at step {step_idx}")
+                break
+
+    def boosterT12v2Locomotion(self):
+        """
+        Smoke-test the pretrained low-level locomotion model in the 2v2 env
+        before any high-level task logic is introduced.
+        """
+        obs, infos = self.env.reset()
+        obs = obs.to(self.device)
+
+        gait_freq = 0.5 * (
+            self.cfg["commands"]["gait_frequency"][0] + self.cfg["commands"]["gait_frequency"][1]
+        )
+        phases = [
+            {"steps": 120, "home": [0.45, 0.0, 0.0, gait_freq], "away": [-0.45, 0.0, 0.0, gait_freq], "label": "forward/backward"},
+            {"steps": 120, "home": [0.0, 0.25, 0.0, gait_freq], "away": [0.0, -0.25, 0.0, gait_freq], "label": "lateral"},
+            {"steps": 120, "home": [0.2, 0.0, 0.6, gait_freq], "away": [-0.2, 0.0, -0.6, gait_freq], "label": "turning"},
+            {"steps": 120, "home": [0.0, 0.0, 0.0, gait_freq], "away": [0.0, 0.0, 0.0, gait_freq], "label": "settle"},
+        ]
+
+        print("[boosterT12v2Locomotion] starting low-level locomotion smoke test")
+        global_step = 0
+        current_phase_end = 0
+
+        for phase_idx, phase in enumerate(phases):
+            current_phase_end += phase["steps"]
+            self.env.set_team_command("home", phase["home"])
+            self.env.set_team_command("away", phase["away"])
+            print(f"[boosterT12v2Locomotion] phase={phase_idx} label={phase['label']} steps={phase['steps']}")
+
+            for _ in range(phase["steps"]):
+                with torch.no_grad():
+                    obs_mod = obs.clone()
+                    obs_mod[:, 6] = self.env.commands[:, 0]
+                    obs_mod[:, 7] = self.env.commands[:, 1]
+                    obs_mod[:, 8] = self.env.commands[:, 2]
+                    dist = self.model.act(obs_mod)
+                    act = dist.loc
+                    obs, rew, done, infos = self.env.step(act)
+                    obs = obs.to(self.device)
+                global_step += 1
+
+                if global_step % 40 == 0 or global_step == current_phase_end:
+                    motion = infos["motion_metrics"]
+                    mean_xy_err = motion["tracking_xy_error"].abs().mean(dim=0)
+                    mean_yaw_err = motion["tracking_yaw_error"].abs().mean()
+                    home_center = self.env.base_pos[self.env.team_indices["home"], :2].mean(dim=0)
+                    away_center = self.env.base_pos[self.env.team_indices["away"], :2].mean(dim=0)
+                    print(
+                        "[boosterT12v2Locomotion] "
+                        f"step={global_step} "
+                        f"home_center=({float(home_center[0]):.2f}, {float(home_center[1]):.2f}) "
+                        f"away_center=({float(away_center[0]):.2f}, {float(away_center[1]):.2f}) "
+                        f"mean_xy_err=({float(mean_xy_err[0]):.3f}, {float(mean_xy_err[1]):.3f}) "
+                        f"mean_yaw_err={float(mean_yaw_err):.3f}"
+                    )
+
+                if torch.any(done).item():
+                    print(f"[boosterT12v2Locomotion] env terminated early at step {global_step}")
+                    return
+
+        print("[boosterT12v2Locomotion] completed")
