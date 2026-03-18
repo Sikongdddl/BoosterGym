@@ -19,15 +19,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.hyperGym.main import build_match_controller
-from envs.hyperGym.renderer import render_record
+from envs.hyperGym.renderer import render_record_with_camera
 
 
 ALLOWED_POLICY_IDS = {
     "move_to_target",
     "pass_to_target",
     "trap_ball",
-    "dribble_to_target",
 }
+
+OBSERVATION_MODES = {
+    "image_with_state_text",
+    "image_only",
+}
+
+DEFAULT_VISION_VIEW = "global"
 
 
 @dataclass
@@ -59,6 +65,7 @@ class BenchmarkCase:
     prior_away_action: Optional[Dict[str, Any]] = None
     reward: float = 0.0
     done: bool = False
+    tags: List[str] | None = None
 
 
 def _clip_target(target: np.ndarray, field_size: np.ndarray) -> np.ndarray:
@@ -171,11 +178,11 @@ class OpenAICompatibleVisionVLM:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
 
-    def decide(self, state: Dict[str, Any], state_text: str, image_path: Path) -> Dict[str, Any]:
+    def decide(self, state: Dict[str, Any], state_text: str, image_path: Path, vision_view: str) -> Dict[str, Any]:
         field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
         home_players = [player for player in state.get("players", []) if player.get("team") == "home"]
         player_schema = ", ".join(
-            f'"{player["player_id"]}": {{"policy_id": "<move_to_target|pass_to_target|trap_ball|dribble_to_target>", "target": [x, y], "reason": "<short_reason>"}}'
+            f'"{player["player_id"]}": {{"policy_id": "<move_to_target|pass_to_target|trap_ball>", "target": [x, y], "reason": "<short_reason>"}}'
             for player in home_players
         )
         home_player_ids = ", ".join(player["player_id"] for player in home_players)
@@ -191,22 +198,35 @@ class OpenAICompatibleVisionVLM:
             "- move_to_target: use when home should run to space, close down a loose ball, or reposition.\n"
             "- trap_ball: use when the ball is free or moving and home should first secure control near the ball.\n"
             "- pass_to_target: use only when a home player can plausibly play the ball now and the target is a useful forward or lateral destination, not the current ball position.\n"
-            "- dribble_to_target: use only when home already controls the ball and should carry it into better space.\n"
             "Hard constraints:\n"
             "- If owner starts with 'home_', do not output trap_ball because home already controls the ball.\n"
             "- If owner is free, prefer move_to_target or trap_ball over pass_to_target.\n"
+            "- If home already controls the ball, prefer move_to_target for ball progression because dribble is not available in this environment.\n"
             "- Avoid meaningless pass_to_target to the current ball location or to a point behind the attack."
         )
-        prompt = (
-            "You are a high-level soccer tactics model for the home team.\n"
-            "The image is the primary input. The text is auxiliary context.\n"
-            f"You must output one action for every home player: {home_player_ids}.\n"
-            f"Field size: width={field[0]:.2f}, height={field[1]:.2f}\n"
-            f"State summary: {state_text}\n"
-            f"{policy_semantics}\n"
-            f"{schema_text}\n"
-            "The answer must be a single JSON object and every target must stay inside field bounds."
+        prompt_lines = [
+            "You are a high-level soccer tactics model for the home team.",
+            "The image is the primary input.",
+            f"You must output one action for every home player: {home_player_ids}.",
+            f"Field size: width={field[0]:.2f}, height={field[1]:.2f}",
+        ]
+        prompt_lines.append(_vision_view_prompt_text(vision_view))
+        prompt_lines.append(_visual_legend_prompt_text())
+        if state_text:
+            prompt_lines.append("The text is auxiliary context.")
+            prompt_lines.append(f"State summary: {state_text}")
+        else:
+            prompt_lines.append(
+                "No structured state text is provided for this query. Infer the situation from the image alone."
+            )
+        prompt_lines.extend(
+            [
+                policy_semantics,
+                schema_text,
+                "The answer must be a single JSON object and every target must stay inside field bounds.",
+            ]
         )
+        prompt = "\n".join(prompt_lines)
 
         payload = {
             "model": self.model,
@@ -282,7 +302,7 @@ def _fallback_decision_for_player(player_id: str, state: Dict[str, Any], fallbac
         pos = np.asarray(player["position"], dtype=np.float32)
         forward = pos + np.asarray([0.8, 0.0], dtype=np.float32)
         return VLMDecision(
-            policy_id="dribble_to_target",
+            policy_id="move_to_target",
             target=_clip_target(0.7 * forward + 0.3 * goal, field),
             source="fallback",
             reason=fallback_reason,
@@ -369,7 +389,6 @@ def _decision_to_action(decision: VLMDecision) -> Dict[str, Any]:
         "move_to_target": "move",
         "pass_to_target": "pass",
         "trap_ball": "trap",
-        "dribble_to_target": "dribble",
     }
     skill = mapping.get(decision.policy_id, "move")
     return {
@@ -416,13 +435,20 @@ def _query_vlm_on_record(
     record: Dict[str, Any],
     state_text: str,
     artifact_dir: Optional[Path],
+    observation_mode: str = "image_with_state_text",
+    vision_view: str = DEFAULT_VISION_VIEW,
     keep_temp_frame: bool = False,
 ) -> Dict[str, Any]:
+    if observation_mode not in OBSERVATION_MODES:
+        raise ValueError(
+            f"Unknown observation_mode={observation_mode}. Available: {sorted(OBSERVATION_MODES)}"
+        )
     state = record["info"]["state"]
-    image = render_record(
+    image = render_record_with_camera(
         record=record,
         field_size=tuple(float(v) for v in state.get("field_size", [10.0, 6.0])),
         frame_size=(960, 640),
+        camera_mode=vision_view,
     )
 
     if artifact_dir is None:
@@ -437,7 +463,8 @@ def _query_vlm_on_record(
     raw_decision: Dict[str, Any]
     fallback_reason = "schema_invalid"
     try:
-        raw_decision = vlm.decide(state=state, state_text=state_text, image_path=frame_path)
+        prompt_state_text = state_text if observation_mode == "image_with_state_text" else ""
+        raw_decision = vlm.decide(state=state, state_text=prompt_state_text, image_path=frame_path, vision_view=vision_view)
     except Exception as exc:
         raw_decision = {"error": str(exc)}
         fallback_reason = f"vlm_error:{exc}"
@@ -448,6 +475,8 @@ def _query_vlm_on_record(
 
     artifact_payload = {
         "artifact_id": artifact_id,
+        "observation_mode": observation_mode,
+        "vision_view": vision_view,
         "state_text": state_text,
         "state": state,
         "raw_decision": raw_decision,
@@ -491,6 +520,12 @@ def _set_manual_state(simulation, state_spec: Dict[str, Any]) -> Dict[str, Any]:
         player.position = np.asarray(player_spec["position"], dtype=np.float32).copy()
         player.velocity = np.asarray(player_spec.get("velocity", [0.0, 0.0]), dtype=np.float32).copy()
         player.has_ball = bool(player_spec.get("has_ball", False))
+        if "heading" in player_spec:
+            player.heading = float(player_spec["heading"])
+        elif float(np.linalg.norm(player.velocity)) > 1e-8:
+            player.heading = float(np.arctan2(float(player.velocity[1]), float(player.velocity[0])))
+        else:
+            player.heading = 0.0 if player.team == "home" else np.pi
 
     simulation.ball.position = np.asarray(state_spec["ball_position"], dtype=np.float32).copy()
     simulation.ball.velocity = np.asarray(state_spec.get("ball_velocity", [0.0, 0.0]), dtype=np.float32).copy()
@@ -579,7 +614,7 @@ def _default_benchmark_cases() -> List[BenchmarkCase]:
             description="home_0 在中场稳控球，合理动作是向前推进或带球进入空间。",
             num_home=1,
             num_away=1,
-            expected_policy_ids=["move_to_target", "dribble_to_target", "pass_to_target"],
+            expected_policy_ids=["move_to_target", "pass_to_target"],
             expected_target_note="Target should advance toward the opponent goal or open space, not back to the current ball position.",
             state_spec={
                 "step": 20,
@@ -601,7 +636,7 @@ def _default_benchmark_cases() -> List[BenchmarkCase]:
             description="home_0 已经带球逼近右侧球门，合理动作应继续向危险区域推进或直接把球送向门前。",
             num_home=1,
             num_away=1,
-            expected_policy_ids=["pass_to_target", "move_to_target", "dribble_to_target"],
+            expected_policy_ids=["pass_to_target", "move_to_target"],
             expected_target_note="Target should stay near the opponent goal mouth or a nearby attacking lane, not retreat.",
             state_spec={
                 "step": 26,
@@ -623,7 +658,7 @@ def _default_benchmark_cases() -> List[BenchmarkCase]:
             description="2v2 中 home_0 控球，home_1 在右前方空位。合理动作通常是推进或把球送向空位。",
             num_home=2,
             num_away=2,
-            expected_policy_ids=["pass_to_target", "move_to_target", "dribble_to_target"],
+            expected_policy_ids=["pass_to_target", "move_to_target"],
             expected_target_note="Target should bias toward home_1 or the right attacking half-space.",
             state_spec={
                 "step": 32,
@@ -640,6 +675,209 @@ def _default_benchmark_cases() -> List[BenchmarkCase]:
             recent_events=[
                 {"event_type": "turnover", "from_player": "away_0", "to_player": "home_0"},
             ],
+            tags=["default", "possession", "2v2"],
+        ),
+        BenchmarkCase(
+            case_id="visual_blindside_recycle",
+            title="Visual Blindside Recycle",
+            description="home_0 面向右侧推进，但真正的安全出球点在其身后左侧的 home_1；该信息在全局视角下清楚，在第一人称下接近盲区。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should recycle toward the blindside support home_1 instead of forcing forward progression.",
+            state_spec={
+                "step": 41,
+                "ball_position": [6.20, 3.00],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [6.20, 3.00], "velocity": [0.10, 0.00], "has_ball": True, "heading": 0.0},
+                    {"position": [4.40, 4.55], "velocity": [0.0, 0.0], "has_ball": False},
+                    {"position": [7.05, 3.18], "velocity": [-0.02, 0.0], "has_ball": False},
+                    {"position": [7.35, 2.35], "velocity": [-0.03, 0.02], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "move", "team": "home", "by": "home_0"},
+                {"event_type": "move", "team": "away", "by": "away_0"},
+            ],
+            tags=["visual_boundary", "blindside", "2v2"],
+        ),
+        BenchmarkCase(
+            case_id="visual_far_side_switch",
+            title="Visual Far-side Switch",
+            description="home_1 在远侧大空位，前方被两名防守人堵住。全局图能看到远侧换边机会，第一人称更容易只盯前方压力。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should switch toward the far-side open teammate rather than dribbling into the front block.",
+            state_spec={
+                "step": 52,
+                "ball_position": [5.90, 2.20],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [5.90, 2.20], "velocity": [0.11, 0.01], "has_ball": True, "heading": 0.05},
+                    {"position": [7.95, 5.05], "velocity": [0.01, 0.0], "has_ball": False},
+                    {"position": [6.70, 2.30], "velocity": [-0.01, 0.0], "has_ball": False},
+                    {"position": [6.85, 1.55], "velocity": [-0.02, 0.0], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "trap_completed", "team": "home", "by": "home_0"},
+            ],
+            tags=["visual_boundary", "far_side", "2v2"],
+        ),
+        BenchmarkCase(
+            case_id="visual_back_post_runner",
+            title="Visual Back-post Runner",
+            description="门前进攻时远门柱的 home_1 是最好的终结点，但该跑位主要体现在全局空间关系里。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should bias toward the back-post runner on the far side of goal.",
+            state_spec={
+                "step": 63,
+                "ball_position": [8.30, 2.55],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [8.30, 2.55], "velocity": [0.08, -0.01], "has_ball": True, "heading": -0.12},
+                    {"position": [9.15, 4.85], "velocity": [0.0, 0.0], "has_ball": False},
+                    {"position": [8.88, 2.45], "velocity": [-0.01, 0.0], "has_ball": False},
+                    {"position": [8.95, 3.35], "velocity": [-0.02, -0.01], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "move", "team": "home", "by": "home_0"},
+                {"event_type": "move", "team": "home", "by": "home_1"},
+            ],
+            tags=["visual_boundary", "back_post", "2v2", "near_goal"],
+        ),
+        BenchmarkCase(
+            case_id="visual_trailing_press_warning",
+            title="Visual Trailing Press Warning",
+            description="away_1 正从 home_0 身后压上，安全选择是尽快分球给前侧空位的 home_1。全局图能看到身后压力，第一人称很难。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should release the ball early to the visible support lane before the blindside press arrives.",
+            state_spec={
+                "step": 48,
+                "ball_position": [6.55, 3.45],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [6.55, 3.45], "velocity": [0.09, 0.02], "has_ball": True, "heading": 0.22},
+                    {"position": [7.85, 4.05], "velocity": [0.0, 0.0], "has_ball": False},
+                    {"position": [7.05, 3.20], "velocity": [-0.02, 0.0], "has_ball": False},
+                    {"position": [5.82, 3.30], "velocity": [0.06, 0.02], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "move", "team": "away", "by": "away_1"},
+            ],
+            tags=["visual_boundary", "blindside_press", "2v2"],
+        ),
+        BenchmarkCase(
+            case_id="medium_front_support_pass",
+            title="Medium Front Support Pass",
+            description="home_1 在 home_0 前右侧清晰可见的空位，合理动作应优先前送给支援点。这一局面对所有设置都不应太难。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should go toward the clearly visible front-right support runner.",
+            state_spec={
+                "step": 44,
+                "ball_position": [6.10, 2.85],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [6.10, 2.85], "velocity": [0.08, 0.01], "has_ball": True, "heading": 0.10},
+                    {"position": [7.55, 3.45], "velocity": [0.02, 0.0], "has_ball": False},
+                    {"position": [6.90, 2.10], "velocity": [-0.02, 0.01], "has_ball": False},
+                    {"position": [7.25, 1.55], "velocity": [-0.01, 0.0], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "trap_completed", "team": "home", "by": "home_0"},
+            ],
+            tags=["medium_boundary", "visible_pass", "2v2"],
+        ),
+        BenchmarkCase(
+            case_id="medium_goalmouth_square_pass",
+            title="Medium Goalmouth Square Pass",
+            description="home_0 已经接近禁区边缘，home_1 在门前横传点。全局和第一人称都应较容易识别这一危险传球。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should square the ball toward the goalmouth support runner.",
+            state_spec={
+                "step": 58,
+                "ball_position": [8.15, 2.75],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [8.15, 2.75], "velocity": [0.07, 0.0], "has_ball": True, "heading": 0.0},
+                    {"position": [9.05, 3.35], "velocity": [0.0, 0.0], "has_ball": False},
+                    {"position": [8.85, 2.30], "velocity": [-0.01, 0.0], "has_ball": False},
+                    {"position": [8.92, 1.70], "velocity": [-0.02, 0.01], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "move", "team": "home", "by": "home_0"},
+            ],
+            tags=["medium_boundary", "goalmouth_pass", "2v2", "near_goal"],
+        ),
+        BenchmarkCase(
+            case_id="medium_peripheral_switch",
+            title="Medium Peripheral Switch",
+            description="home_1 位于前左侧的外围空位，BEV 更容易看清整体空当，第一人称需要处理更偏侧向的支援点。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should switch into the front-left peripheral support lane rather than forcing dribble through the block.",
+            state_spec={
+                "step": 47,
+                "ball_position": [6.35, 2.55],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [6.35, 2.55], "velocity": [0.09, 0.02], "has_ball": True, "heading": 0.20},
+                    {"position": [7.20, 4.10], "velocity": [0.0, 0.0], "has_ball": False},
+                    {"position": [6.95, 2.70], "velocity": [-0.01, 0.0], "has_ball": False},
+                    {"position": [7.25, 1.80], "velocity": [-0.01, 0.01], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "trap_completed", "team": "home", "by": "home_0"},
+            ],
+            tags=["medium_boundary", "peripheral_pass", "2v2"],
+        ),
+        BenchmarkCase(
+            case_id="medium_pressure_release",
+            title="Medium Pressure Release",
+            description="away_0 贴近 home_0，home_1 在前方短距离接应点。状态文本和全局视角都应帮助模型更愿意尽快分球。",
+            num_home=2,
+            num_away=2,
+            expected_policy_ids=["pass_to_target"],
+            expected_target_note="Target should release early to the nearby forward support option under pressure.",
+            state_spec={
+                "step": 49,
+                "ball_position": [6.00, 3.10],
+                "ball_velocity": [0.0, 0.0],
+                "ball_owner_id": "home_0",
+                "players": [
+                    {"position": [6.00, 3.10], "velocity": [0.07, 0.0], "has_ball": True, "heading": 0.05},
+                    {"position": [7.10, 3.55], "velocity": [0.0, 0.0], "has_ball": False},
+                    {"position": [6.55, 3.00], "velocity": [-0.02, 0.0], "has_ball": False},
+                    {"position": [7.00, 2.30], "velocity": [-0.01, 0.0], "has_ball": False},
+                ],
+            },
+            recent_events=[
+                {"event_type": "move", "team": "away", "by": "away_0"},
+            ],
+            tags=["medium_boundary", "pressure_release", "2v2"],
         ),
     ]
 
@@ -662,6 +900,8 @@ def run_rollout(
     num_home: int,
     num_away: int,
     start_case_id: str,
+    observation_mode: str,
+    vision_view: str,
 ) -> Dict[str, Any]:
     start_case = _get_benchmark_case(start_case_id) if start_case_id else None
     rollout_num_home = start_case.num_home if start_case is not None else num_home
@@ -721,6 +961,8 @@ def run_rollout(
                 record=record,
                 state_text=state_text,
                 artifact_dir=step_artifact_dir,
+                observation_mode=observation_mode,
+                vision_view=vision_view,
             )
 
             team_decision = query["decision"]
@@ -776,6 +1018,8 @@ def run_rollout(
         "episode_summaries": episode_summaries,
         "artifact_dir": str(artifact_dir) if artifact_dir is not None else "",
         "start_case_id": start_case_id,
+        "observation_mode": observation_mode,
+        "vision_view": vision_view,
     }
     print("\n=== VLM PoC Rollout Result ===")
     print(f"episodes={result['episodes']}")
@@ -788,12 +1032,21 @@ def run_benchmark(
     vlm_model: str,
     vlm_base_url: str,
     artifact_dir: Optional[Path],
+    observation_mode: str,
+    vision_view: str,
+    case_ids: List[str],
 ) -> Dict[str, Any]:
     vlm = _build_vlm(vlm_model, vlm_base_url)
     case_results: List[Dict[str, Any]] = []
     matched_count = 0
+    available_cases = _default_benchmark_cases()
+    selected_case_ids = set(case_ids)
+    cases = [case for case in available_cases if not selected_case_ids or case.case_id in selected_case_ids]
+    if selected_case_ids and not cases:
+        available = ", ".join(case.case_id for case in available_cases)
+        raise ValueError(f"No benchmark cases matched case_ids={sorted(selected_case_ids)}. Available: {available}")
 
-    for case in _default_benchmark_cases():
+    for case in cases:
         controller = build_match_controller(
             num_home=case.num_home,
             num_away=case.num_away,
@@ -816,6 +1069,8 @@ def run_benchmark(
             record=record,
             state_text=state_text,
             artifact_dir=artifact_dir,
+            observation_mode=observation_mode,
+            vision_view=vision_view,
         )
         team_decision = query["decision"]
         decision = team_decision.players[case.expected_player_id]
@@ -834,6 +1089,7 @@ def run_benchmark(
             "expected_player_id": case.expected_player_id,
             "expected_policy_ids": case.expected_policy_ids,
             "expected_target_note": case.expected_target_note,
+            "tags": case.tags or [],
             "state_text": state_text,
             "raw_decision": query["raw_decision"],
             "parsed_decision": {
@@ -869,12 +1125,40 @@ def run_benchmark(
         "policy_match_rate": match_rate,
         "case_results": case_results,
         "artifact_dir": str(artifact_dir) if artifact_dir is not None else "",
+        "observation_mode": observation_mode,
+        "vision_view": vision_view,
+        "selected_case_ids": sorted(selected_case_ids),
     }
     print("\n=== VLM PoC Benchmark Result ===")
     print(f"cases={result['cases']}")
     print(f"policy_matches={result['policy_matches']}")
     print(f"policy_match_rate={result['policy_match_rate']:.4f}")
     return result
+
+
+def _vision_view_prompt_text(vision_view: str) -> str:
+    if vision_view == "global":
+        return "Image view: full-field broadcast-style top-down view."
+    if vision_view.startswith("ego_fp_"):
+        ego_player_id = vision_view[len("ego_fp_"):]
+        return (
+            f"Image view: first-person ego-centric view from {ego_player_id}. "
+            "The image is forward-facing, local, and only shows what is roughly in front of that player."
+        )
+    if vision_view.startswith("ego_"):
+        ego_player_id = vision_view[len("ego_"):]
+        return (
+            f"Image view: ego-centric local crop centered on {ego_player_id}. "
+            "The image does not show the full field, only the local neighborhood around that player."
+        )
+    raise ValueError(f"Unknown vision_view={vision_view}")
+
+
+def _visual_legend_prompt_text() -> str:
+    return (
+        "Visual legend: blue players are home, red players are away, yellow ball is the soccer ball. "
+        "If a player has a yellow ring/halo around them, that player currently controls the ball."
+    )
 
 
 def main() -> None:
@@ -923,7 +1207,27 @@ def main() -> None:
         default="",
         help="可选：将最终统计结果保存到 JSON 文件",
     )
+    parser.add_argument(
+        "--observation-mode",
+        type=str,
+        default="image_with_state_text",
+        choices=sorted(OBSERVATION_MODES),
+        help="image_with_state_text: 图像+状态文本；image_only: 仅图像，不把状态文本发给 VLM",
+    )
+    parser.add_argument(
+        "--vision-view",
+        type=str,
+        default=DEFAULT_VISION_VIEW,
+        help="视觉输入视角。global 为原始全局视角；ego_home_0 这类值表示以对应球员为中心的局部视角",
+    )
+    parser.add_argument(
+        "--case-ids",
+        type=str,
+        default="",
+        help="benchmark 模式可选：只运行指定 case，逗号分隔，例如 visual_blindside_recycle,visual_far_side_switch",
+    )
     args = parser.parse_args()
+    case_ids = [item.strip() for item in args.case_ids.split(",") if item.strip()]
 
     artifact_dir = Path(args.save_artifacts_dir) if args.save_artifacts_dir else None
 
@@ -938,12 +1242,17 @@ def main() -> None:
             num_home=args.num_home,
             num_away=args.num_away,
             start_case_id=args.start_case_id,
+            observation_mode=args.observation_mode,
+            vision_view=args.vision_view,
         )
     else:
         result = run_benchmark(
             vlm_model=args.vlm_model,
             vlm_base_url=args.vlm_base_url,
             artifact_dir=artifact_dir,
+            observation_mode=args.observation_mode,
+            vision_view=args.vision_view,
+            case_ids=case_ids,
         )
 
     if args.save_json:

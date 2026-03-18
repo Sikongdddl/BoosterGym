@@ -93,18 +93,46 @@ class HyperGymSimulation:
 
     def _spawn_layout(self) -> None:
         width, height = self.params.field_size
+        min_gap = self.params.player_collision_radius * 2.4
+        placed_positions: List[np.ndarray] = []
+
         for idx, player in enumerate(self.players):
             if player.team == "home":
-                x = 1.0 + idx * 0.8
-                y = height * (0.35 + 0.3 * idx / max(1, self.num_home))
+                lane_idx = idx
+                base_x = 1.0 + 0.7 * lane_idx
+                base_y = height * (0.28 + 0.44 * (lane_idx + 1) / (self.num_home + 1))
+                x_low, x_high = 0.7, min(width * 0.42, base_x + 0.45)
             else:
                 away_idx = idx - self.num_home
-                x = width * 0.6 + away_idx * 0.7
-                y = height * (0.3 + 0.4 * away_idx / max(1, self.num_away))
-            player.reset(np.asarray([x, y], dtype=np.float32))
+                base_x = width * 0.64 + 0.6 * away_idx
+                base_y = height * (0.24 + 0.52 * (away_idx + 1) / (self.num_away + 1))
+                x_low, x_high = max(width * 0.58, base_x - 0.45), width - 0.7
 
-        start_ball = self.players[0].position.copy()
-        start_ball[0] += self.params.player_collision_radius + self.ball.radius + 0.02
+            y_low = 0.5
+            y_high = height - 0.5
+            candidate = np.asarray([base_x, base_y], dtype=np.float32)
+            for _ in range(24):
+                sampled = np.asarray([
+                    self.rng.uniform(x_low, x_high),
+                    self.rng.uniform(y_low, y_high),
+                ], dtype=np.float32)
+                if all(float(np.linalg.norm(sampled - existing)) >= min_gap for existing in placed_positions):
+                    candidate = sampled
+                    break
+            player.reset(candidate)
+            placed_positions.append(candidate.copy())
+
+        start_ball = np.asarray([
+            self.rng.uniform(width * 0.28, width * 0.72),
+            self.rng.uniform(height * 0.2, height * 0.8),
+        ], dtype=np.float32)
+        for _ in range(24):
+            if all(float(np.linalg.norm(start_ball - pos)) >= min_gap * 0.75 for pos in placed_positions):
+                break
+            start_ball = np.asarray([
+                self.rng.uniform(width * 0.28, width * 0.72),
+                self.rng.uniform(height * 0.2, height * 0.8),
+            ], dtype=np.float32)
         start_ball = self._clip_ball_position(start_ball)
         self.ball.reset(start_ball, None)
 
