@@ -23,8 +23,8 @@ runner:
   use_wandb: false
 
 viewer:
-  pos: [8.0, -8.0, 5.0]
-  lookat: [0.0, 0.0, 0.5]
+  pos: [12.0, -12.0, 8.0]
+  lookat: [0.0, 0.0, 0.8]
   record_video: false
   record_interval: 5.0
   record_env_idx: 0
@@ -133,14 +133,45 @@ game:
   num_home: 2
   num_away: 2
   episode_length_steps: 1000
-  enable_field_decor: false
   ball_radius: 0.11
   spawn:
-    home_x: -2.0
-    away_x: 2.0
-    y_offsets: [-0.9, 0.9]
+    home_x: -3.5
+    away_x: 3.5
+    y_offsets: [-1.5, 1.5]
   ball_dynamics:
     density: 80.0
     linear_damping: 0.015
     angular_damping: 0.01
     max_angular_velocity: 100.0
+  field:
+    enable_markings: true
+    enable_goals: true
+    enable_grass_strips: false
+    length: 14.0
+    width: 9.0
+    line_width: 0.05
+    line_thickness: 0.015
+    center_circle_radius: 1.5
+    goal_area_length: 1.0
+    goal_area_width: 4.0
+    penalty_area_length: 3.0
+    penalty_area_width: 6.0
+    penalty_mark_distance: 2.1
+    border_strip_width: 1.0
+    goal_width: 2.6
+    goal_height: 1.8
+    goal_depth: 0.6
+    goal_post_size: 0.10
+
+midlevel:
+  eval_mode: true
+  policies:
+    move_to_target:
+      checkpoint: null
+      glob: "logs/ckpt/chaseBall/*.pt"
+    pass_to_target:
+      checkpoint: null
+      glob: "logs/ckpt/passBall/sac/*.pt"
+    trap_ball:
+      checkpoint: null
+      glob: null

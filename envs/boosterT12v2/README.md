@@ -9,6 +9,7 @@
 - 通过独立的多人底层控制器创建 `4` 台 T1 + `1` 个球 + 标准场地
 - 可被 `scripts/runner.py` 以新入口拉起
 - 能输出多人 locomotion obs 和 team-level infer state
+- 能接收逐 robot 的 `{policy_id, target}` 并在环境内部路由到 midlevel policy
 
 ## 文件
 
@@ -28,13 +29,16 @@
 - 面向 infer 的 team-level state 导出
 - `Runner.boosterT12v2()` 的最小启动入口
 - `Runner.boosterT12v2Locomotion()` 的低层运动 smoke test
+- `Runner.boosterT12v2PolicyBridge()` 的 `policy_id + target -> midlevel -> command` smoke test
 - 默认会通过 `basic.checkpoint: -1` 自动加载 `logs/low/**/*.pth` 下最新的低层 locomotion 权重
+- `move_to_target` 当前默认从 `logs/ckpt/chaseBall/*.pt` 自动找最新 midlevel policy
+- `pass_to_target` 当前默认从 `logs/ckpt/passBall/sac/*.pt` 自动找最新 midlevel policy
 
 ## 当前未完成
 
 - 比赛规则与 reward
 - 球权、碰撞语义、射门/出界/重置逻辑
-- 真正的 2v2 高层动作接口设计
+- `trap_ball` 的 midlevel checkpoint 还没接上，当前只做显式 fallback
 - 训练链路适配
 - IsaacGym 运行态 smoke test 结果确认
 

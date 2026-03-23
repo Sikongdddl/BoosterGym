@@ -1221,3 +1221,65 @@ class Runner:
                     return
 
         print("[boosterT12v2Locomotion] completed")
+
+    def boosterT12v2PolicyBridge(self):
+        """
+        Smoke-test the policy_id + target -> midlevel -> vx/vy/theta bridge.
+        """
+        obs, infos = self.env.reset()
+        obs = obs.to(self.device)
+        print(f"[boosterT12v2PolicyBridge] midlevel_status={self.env.midlevel_policy.status()}")
+
+        phases = [
+            {
+                "steps": 120,
+                "label": "all_move_forward_space",
+                "builder": lambda: {
+                    "home_0": {"policy_id": "move_to_target", "target": [1.5, -0.8]},
+                    "home_1": {"policy_id": "move_to_target", "target": [1.5, 0.8]},
+                    "away_0": {"policy_id": "move_to_target", "target": [-1.5, -0.8]},
+                    "away_1": {"policy_id": "move_to_target", "target": [-1.5, 0.8]},
+                },
+            },
+            {
+                "steps": 120,
+                "label": "home_pass_shape",
+                "builder": lambda: {
+                    "home_0": {"policy_id": "pass_to_target", "target": [2.0, 0.4]},
+                    "home_1": {"policy_id": "move_to_target", "target": [1.8, 1.1]},
+                    "away_0": {"policy_id": "move_to_target", "target": [-1.2, -0.5]},
+                    "away_1": {"policy_id": "move_to_target", "target": [-1.2, 0.5]},
+                },
+            },
+        ]
+
+        global_step = 0
+        for phase_idx, phase in enumerate(phases):
+            policy_actions = phase["builder"]()
+            self.env.apply_policy_command(policy_actions)
+            print(f"[boosterT12v2PolicyBridge] phase={phase_idx} label={phase['label']}")
+
+            for _ in range(phase["steps"]):
+                with torch.no_grad():
+                    obs_mod = obs.clone()
+                    obs_mod[:, 6] = self.env.commands[:, 0]
+                    obs_mod[:, 7] = self.env.commands[:, 1]
+                    obs_mod[:, 8] = self.env.commands[:, 2]
+                    dist = self.model.act(obs_mod)
+                    act = dist.loc
+                    obs, rew, done, infos = self.env.step(act)
+                    obs = obs.to(self.device)
+                global_step += 1
+
+                if global_step % 40 == 0:
+                    print(
+                        "[boosterT12v2PolicyBridge] "
+                        f"step={global_step} "
+                        f"commands={self.env.commands.detach().cpu().numpy().round(3).tolist()}"
+                    )
+
+                if torch.any(done).item():
+                    print(f"[boosterT12v2PolicyBridge] env terminated early at step {global_step}")
+                    return
+
+        print("[boosterT12v2PolicyBridge] completed")

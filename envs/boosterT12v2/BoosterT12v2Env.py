@@ -1,9 +1,11 @@
 from typing import Dict
 
+import numpy as np
 import torch
 from isaacgym import gymtorch
-from isaacgym.torch_utils import get_axis_params, quat_rotate_inverse, to_torch
+from isaacgym.torch_utils import get_axis_params, quat_rotate, quat_rotate_inverse, to_torch
 
+from envs.components.MidLevelPolicyManager import MidLevelPolicyManager
 from envs.components.MultiAgentLowLevelController import MultiAgentLowLevelController
 
 
@@ -26,6 +28,7 @@ class BoosterT12v2Env:
         self.num_actions = cfg["env"]["num_actions"]
         self.num_team_obs = int(cfg["env"].get("num_team_observations", 40))
         self.dt = cfg["control"]["decimation"] * cfg["sim"]["dt"]
+        self.midlevel_policy = MidLevelPolicyManager(cfg, device=self.controller.device)
         self._init_buffers()
 
     def _init_buffers(self):
@@ -110,6 +113,7 @@ class BoosterT12v2Env:
             "home": torch.arange(0, self.num_home, device=dev, dtype=torch.long),
             "away": torch.arange(self.num_home, self.num_players, device=dev, dtype=torch.long),
         }
+        self.last_policy_actions = self.get_policy_action_space()
 
     def reset(self):
         self.controller.reset_robots(
@@ -192,6 +196,17 @@ class BoosterT12v2Env:
         )
         return {name: [0.0, 0.0, 0.0, gait_freq] for name in self.player_names}
 
+    def get_policy_action_space(self):
+        ball_state = self.get_ball_state()
+        ball_xy = ball_state["pos"][:2]
+        return {
+            name: {
+                "policy_id": "move_to_target",
+                "target": [float(ball_xy[0]), float(ball_xy[1])],
+            }
+            for name in self.player_names
+        }
+
     def apply_high_level_command(self, cmd, smooth=None):
         if isinstance(cmd, dict):
             for name, values in cmd.items():
@@ -232,6 +247,115 @@ class BoosterT12v2Env:
             full_cmd[self.player_names[player_idx]] = team_cmd[idx].tolist()
         self.apply_high_level_command(full_cmd, smooth=smooth)
 
+    def _compute_chase_obs_for_player(self, player_idx: int, target_xy: torch.Tensor) -> torch.Tensor:
+        robot_pos = self.base_pos[player_idx, :3]
+        delta_world = torch.zeros(3, device=self.controller.device, dtype=robot_pos.dtype)
+        delta_world[:2] = target_xy - robot_pos[:2]
+        delta_body = quat_rotate_inverse(self.base_quat[player_idx : player_idx + 1], delta_world[None, :]).squeeze(0)
+        delta_xy_body = delta_body[:2]
+        dist_xy = torch.norm(delta_xy_body) + 1e-6
+        bearing = torch.atan2(delta_xy_body[1], delta_xy_body[0])
+        cos_b = torch.cos(bearing)
+        sin_b = torch.sin(bearing)
+        v_body_xy = self.base_lin_vel[player_idx, :2]
+        speed_toward = v_body_xy[0] * cos_b + v_body_xy[1] * sin_b
+        return torch.stack(
+            [
+                delta_xy_body[0],
+                delta_xy_body[1],
+                dist_xy,
+                cos_b,
+                sin_b,
+                v_body_xy[0],
+                v_body_xy[1],
+                speed_toward,
+            ],
+            dim=0,
+        )
+
+    def _compute_pass_obs_for_player(self, player_idx: int, target_xy: torch.Tensor) -> torch.Tensor:
+        base_pos = self.base_pos[player_idx, :3]
+        base_x = base_pos[0]
+        base_y = base_pos[1]
+        ball_pos = self.root_states[self.ball_actor_index, 0:3]
+        ball_xy = ball_pos[:2]
+        ball_x = ball_xy[0]
+        ball_y = ball_xy[1]
+        v_body = self.base_lin_vel[player_idx, :3]
+        v_world = quat_rotate(self.base_quat[player_idx : player_idx + 1], v_body[None, :]).squeeze(0)
+        delta_world = torch.zeros(3, device=self.controller.device, dtype=base_pos.dtype)
+        delta_world[0] = ball_x - base_x
+        delta_world[1] = ball_y - base_y
+        delta_body = quat_rotate_inverse(self.base_quat[player_idx : player_idx + 1], delta_world[None, :]).squeeze(0)
+        rel_ball_x = delta_body[0]
+        rel_ball_y = delta_body[1]
+        rel_ball_ang = torch.atan2(rel_ball_y, rel_ball_x + 1e-6)
+        return torch.stack(
+            [
+                base_x,
+                base_y,
+                ball_x,
+                ball_y,
+                v_world[0],
+                v_world[1],
+                target_xy[0],
+                target_xy[1],
+                rel_ball_x,
+                rel_ball_y,
+                rel_ball_ang,
+            ],
+            dim=0,
+        )
+
+    def _policy_target_to_tensor(self, target) -> torch.Tensor:
+        target_tensor = torch.as_tensor(target, device=self.controller.device, dtype=self.base_pos.dtype)
+        if target_tensor.numel() < 2:
+            raise ValueError(f"Invalid target {target}")
+        return target_tensor[:2]
+
+    def policy_action_to_command(self, player_name: str, policy_action: Dict, eval_mode=None) -> np.ndarray:
+        player_idx = self.player_name_to_index[player_name]
+        policy_id = str(policy_action.get("policy_id", "move_to_target"))
+        target_xy = self._policy_target_to_tensor(policy_action.get("target", self.base_pos[player_idx, :2]))
+
+        obs_builder = {
+            "move_to_target": self._compute_chase_obs_for_player,
+            "dribble_to_target": self._compute_chase_obs_for_player,
+            "pass_to_target": self._compute_pass_obs_for_player,
+        }
+        routed_policy = {
+            "move_to_target": "move_to_target",
+            "dribble_to_target": "move_to_target",
+            "pass_to_target": "pass_to_target",
+        }.get(policy_id)
+
+        if routed_policy is None or routed_policy not in obs_builder:
+            return np.asarray([0.0, 0.0, 0.0, float(self.gait_frequency[player_idx].item())], dtype=np.float32)
+
+        if not self.midlevel_policy.has_policy(routed_policy):
+            return np.asarray([0.0, 0.0, 0.0, float(self.gait_frequency[player_idx].item())], dtype=np.float32)
+
+        obs_vec = obs_builder[routed_policy](player_idx, target_xy)
+        action_xyz = self.midlevel_policy.act(routed_policy, obs_vec.detach().cpu().numpy(), eval_mode=eval_mode)
+        gait_freq = 0.5 * (
+            self.cfg["commands"]["gait_frequency"][0] + self.cfg["commands"]["gait_frequency"][1]
+        )
+        return np.asarray([float(action_xyz[0]), float(action_xyz[1]), float(action_xyz[2]), gait_freq], dtype=np.float32)
+
+    def apply_policy_command(self, policy_actions: Dict[str, Dict], smooth=None, eval_mode=None):
+        cmd = {}
+        for player_name in self.player_names:
+            policy_action = policy_actions.get(player_name, {"policy_id": "move_to_target", "target": self.base_pos[self.player_name_to_index[player_name], :2]})
+            cmd[player_name] = self.policy_action_to_command(player_name, policy_action, eval_mode=eval_mode).tolist()
+        self.last_policy_actions = {
+            player_name: {
+                "policy_id": str(policy_actions.get(player_name, {}).get("policy_id", "move_to_target")),
+                "target": list(np.asarray(policy_actions.get(player_name, {}).get("target", self.base_pos[self.player_name_to_index[player_name], :2].detach().cpu().numpy()), dtype=np.float32)[:2]),
+            }
+            for player_name in self.player_names
+        }
+        self.apply_high_level_command(cmd, smooth=smooth)
+
     def pre_step(self, actions):
         self.actions[:] = torch.clip(
             actions,
@@ -265,6 +389,8 @@ class BoosterT12v2Env:
         self.extras["ball_state"] = self.get_ball_state()
         self.extras["team_obs"] = self.compute_midlevel_obs()
         self.extras["motion_metrics"] = self.summarize_motion_metrics()
+        self.extras["midlevel_policy_status"] = self.midlevel_policy.status()
+        self.extras["policy_actions"] = self.last_policy_actions
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_inference_state(self) -> Dict[str, Dict[str, torch.Tensor]]:

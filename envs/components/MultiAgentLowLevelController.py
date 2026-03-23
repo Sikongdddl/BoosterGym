@@ -6,7 +6,7 @@ from isaacgym import gymapi, gymtorch
 from isaacgym.torch_utils import quat_from_euler_xyz, to_torch
 
 from envs.base_task import BaseTask
-from utils.scene import create_field_auxiliary_lines, create_field_boundary_lines, create_strip_grass
+from utils.scene import create_humanoid_adult_field
 
 
 class MultiAgentLowLevelController(BaseTask):
@@ -20,7 +20,8 @@ class MultiAgentLowLevelController(BaseTask):
         self.num_home = int(self.game_cfg.get("num_home", 2))
         self.num_away = int(self.game_cfg.get("num_away", 2))
         self.num_players = self.num_home + self.num_away
-        self.enable_field_decor = bool(self.game_cfg.get("enable_field_decor", False))
+        self.field_cfg = self.game_cfg.get("field", {})
+        self.enable_field_decor = bool(self.field_cfg.get("enable_markings", True))
         super().__init__(cfg)
         self.additional_rigid_num = 0
         self._create_envs()
@@ -209,9 +210,7 @@ class MultiAgentLowLevelController(BaseTask):
         self.additional_rigid_num += 1
 
         if self.enable_field_decor:
-            self.additional_rigid_num += create_strip_grass(self, env_handle, length=40.0, width=25.0, num_strips=15)
-            self.additional_rigid_num += create_field_boundary_lines(self, env_handle, length=40.0, width=25.0, line_width=0.15)
-            self.additional_rigid_num += create_field_auxiliary_lines(self, env_handle, length=40.0, width=25.0)
+            self.additional_rigid_num += create_humanoid_adult_field(self, env_handle, self.field_cfg)
 
         self.robot_actor_indices = torch.tensor(self.robot_actor_indices, device=self.device, dtype=torch.long)
         self.total_num_dofs = self.num_players * self.num_dofs_per_robot
