@@ -6,7 +6,7 @@ try:
     from envs.chaseBall.ChaseBallEnv import ChaseBallEnv
     from envs.passBall.PassBallEnv import PassBallEnv
     from envs.trapBall.TrapBallEnv import TrapBallEnv
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     # Allow lightweight modules like hyperGym to be imported without Isaac Gym.
     BoosterT12v2Env = None
     MidLevelPolicyManager = None

@@ -50,6 +50,11 @@ class HyperParams:
     base_intercept_prob: float = 0.15
     defender_speed_scale: float = 1.0
     defender_press_bias: float = 1.0
+    end_on_ball_out: bool = False
+    control_capture_radius: float = 0.22
+    control_release_radius: float = 0.28
+    move_touch_radius: float = 0.24
+    move_touch_speed: float = 0.12
 
 
 class HyperGymSimulation:
@@ -157,6 +162,7 @@ class HyperGymSimulation:
     def step(self, action: Dict[str, Any], opponent_action: Dict[str, Any] | None = None) -> Tuple[np.ndarray, float, bool, Dict]:
         self.step_count += 1
         step_events: List[Dict] = []
+        self._refresh_ball_control(step_events, emit_events=False)
 
         home_action = self._normalize_actions(action, team="home")
         if opponent_action is None and self.opponent_policy is not None:
@@ -170,7 +176,9 @@ class HyperGymSimulation:
         self._resolve_player_collisions(step_events)
         self._resolve_ball_motion(step_events)
         self._resolve_possession(step_events)
+        self._resolve_scramble(step_events)
         self._resolve_player_collisions(step_events)
+        self._refresh_ball_control(step_events, emit_events=True)
 
         state = self._build_state()
         done = self.step_count >= self.params.max_steps or self.winner is not None
@@ -336,17 +344,14 @@ class HyperGymSimulation:
 
         actor.move_towards(target)
         actor.clamp(self.params.field_size)
-        if owner is not None and owner.player_id == actor.player_id:
-            self.ball.attach_to(actor.player_id, actor.position)
+        if self._can_attempt_move_touch(actor):
+            if self._should_lose_ball(actor, action_type="move", step_events=step_events):
+                self._apply_loose_ball(actor, target, team, step_events)
+            else:
+                self._apply_move_touch(actor, target, team, step_events)
         step_events.append({"event_type": "move", "team": team, "by": actor.player_id, "target": target.copy()})
 
     def _resolve_ball_motion(self, step_events: List[Dict]) -> None:
-        owner = self._ball_owner()
-        if owner is not None:
-            owner.clamp(self.params.field_size)
-            self.ball.attach_to(owner.player_id, owner.position)
-            return
-
         damping_rate = self.ball.linear_damping / max(self.ball.mass, 1e-6)
         substeps = max(1, int(self.params.ball_motion_substeps))
         sub_dt = self.params.sim_dt / substeps
@@ -361,6 +366,13 @@ class HyperGymSimulation:
                 step_events.append({"event_type": "goal_scored", "team": scorer})
                 return
 
+            if self.params.end_on_ball_out:
+                out_info = self._check_ball_out(self.ball.position)
+                if out_info is not None:
+                    self.winner = "ball_out"
+                    step_events.append(out_info)
+                    return
+
             self._resolve_wall_collision(step_events)
             self._resolve_ball_player_collisions(step_events)
             self.ball.velocity = self.ball.velocity * decay
@@ -369,17 +381,20 @@ class HyperGymSimulation:
             self.ball.velocity[:] = 0.0
 
     def _resolve_possession(self, step_events: List[Dict]) -> None:
+        # Possession is inferred from loose-ball contact rather than hard attachment.
         owner = self._ball_owner()
-        if owner is None:
+        if owner is None or float(np.linalg.norm(self.ball.velocity)) > self.params.trap_safe_speed:
             return
 
-        nearby = [player for player in self.players if player.team != owner.team and player.distance_to(owner.position) <= self.params.steal_radius]
+        nearby = [
+            player
+            for player in self.players
+            if player.team != owner.team and player.distance_to(self.ball.position) <= self.params.steal_radius
+        ]
         if nearby and self.rng.random() < 0.08 * self.params.defender_press_bias:
             thief = nearby[0]
-            owner.has_ball = False
-            thief.has_ball = True
-            self.ball.attach_to(thief.player_id, thief.position)
-            step_events.append({"event_type": "turnover", "from_player": owner.player_id, "to_player": thief.player_id})
+            self.ball.owner_id = thief.player_id
+            step_events.append({"event_type": "steal_attempt_won", "from_player": owner.player_id, "to_player": thief.player_id})
 
     def _ball_owner(self) -> Player | None:
         if self.ball.owner_id is None:
@@ -426,6 +441,24 @@ class HyperGymSimulation:
             return "away"
         return None
 
+    def _check_ball_out(self, position: np.ndarray) -> Dict[str, Any] | None:
+        width, height = self.params.field_size
+        x = float(position[0])
+        y = float(position[1])
+        r = float(self.ball.radius)
+        goal_min_y = height * 0.5 - self.params.goal_half_width
+        goal_max_y = height * 0.5 + self.params.goal_half_width
+        in_goal_mouth = goal_min_y <= y <= goal_max_y
+        if x <= r and not in_goal_mouth:
+            return {"event_type": "ball_out_of_bounds", "side": "left", "position": np.asarray(position, dtype=np.float32).copy()}
+        if x >= width - r and not in_goal_mouth:
+            return {"event_type": "ball_out_of_bounds", "side": "right", "position": np.asarray(position, dtype=np.float32).copy()}
+        if y <= r:
+            return {"event_type": "ball_out_of_bounds", "side": "bottom", "position": np.asarray(position, dtype=np.float32).copy()}
+        if y >= height - r:
+            return {"event_type": "ball_out_of_bounds", "side": "top", "position": np.asarray(position, dtype=np.float32).copy()}
+        return None
+
     def _resolve_player_collisions(self, step_events: List[Dict]) -> None:
         min_dist = max(1e-6, 2.0 * self.params.player_collision_radius)
         width, height = self.params.field_size
@@ -453,11 +486,6 @@ class HyperGymSimulation:
                 a.position[1] = float(np.clip(a.position[1], 0.0, height))
                 b.position[0] = float(np.clip(b.position[0], 0.0, width))
                 b.position[1] = float(np.clip(b.position[1], 0.0, height))
-
-                if self.ball.owner_id == a.player_id:
-                    self.ball.attach_to(a.player_id, a.position)
-                elif self.ball.owner_id == b.player_id:
-                    self.ball.attach_to(b.player_id, b.position)
 
                 step_events.append({
                     "event_type": "player_collision_resolved",
@@ -563,6 +591,89 @@ class HyperGymSimulation:
             self.ball.position = self._clip_ball_position(actor.position + direction * (self.params.player_collision_radius + self.ball.radius + 0.01))
             step_events.append({"event_type": "dead_ball", "team": team, "by": actor.player_id, "ball_speed": float(np.linalg.norm(self.ball.velocity))})
 
+    def _apply_move_touch(self, actor: Player, target: np.ndarray, team: str, step_events: List[Dict]) -> None:
+        touch_dir = np.asarray(target, dtype=np.float32) - self.ball.position
+        norm = float(np.linalg.norm(touch_dir))
+        if norm < 1e-8:
+            touch_dir = np.asarray([1.0 if team == "home" else -1.0, 0.0], dtype=np.float32)
+        else:
+            touch_dir = touch_dir / norm
+        self.ball.owner_id = None
+        current_speed = float(np.linalg.norm(self.ball.velocity))
+        touch_speed = max(current_speed, self.params.move_touch_speed)
+        self.ball.velocity = touch_dir * float(touch_speed)
+        contact_offset = touch_dir * (self.params.player_collision_radius + self.ball.radius + 0.02)
+        self.ball.position = self._clip_ball_position(actor.position + contact_offset)
+        step_events.append({
+            "event_type": "move_touch",
+            "team": team,
+            "by": actor.player_id,
+            "ball_speed": float(np.linalg.norm(self.ball.velocity)),
+        })
+
+    def _resolve_scramble(self, step_events: List[Dict]) -> None:
+        if float(np.linalg.norm(self.ball.velocity)) > self.params.trap_stop_speed:
+            return
+        nearby = [
+            player
+            for player in self.players
+            if player.distance_to(self.ball.position) <= self.params.contest_radius
+        ]
+        if len(nearby) < 2:
+            return
+        teams = {player.team for player in nearby}
+        if len(teams) < 2:
+            return
+        centroid = np.mean([player.position for player in nearby], axis=0)
+        field_center = np.asarray(
+            [0.5 * self.params.field_size[0], 0.5 * self.params.field_size[1]],
+            dtype=np.float32,
+        )
+        escape_dir = field_center - centroid
+        norm = float(np.linalg.norm(escape_dir))
+        if norm < 1e-8:
+            angle = self.rng.uniform(0.0, 2.0 * np.pi)
+            escape_dir = np.asarray([np.cos(angle), np.sin(angle)], dtype=np.float32)
+        else:
+            escape_dir = escape_dir / norm
+        angle_jitter = self.rng.uniform(-0.6, 0.6)
+        rot = np.asarray(
+            [
+                [np.cos(angle_jitter), -np.sin(angle_jitter)],
+                [np.sin(angle_jitter), np.cos(angle_jitter)],
+            ],
+            dtype=np.float32,
+        )
+        escape_dir = rot @ escape_dir
+        escape_speed = float(self.rng.uniform(max(self.params.trap_safe_speed, 0.14), max(self.params.trap_safe_speed + 0.08, 0.24)))
+        self.ball.owner_id = None
+        for player in self.players:
+            player.has_ball = False
+        self.ball.velocity = escape_dir * escape_speed
+        self.ball.position = self._clip_ball_position(
+            self.ball.position + escape_dir * (self.params.player_collision_radius + self.ball.radius + 0.04)
+        )
+        step_events.append({
+            "event_type": "loose_ball_scramble",
+            "players": [player.player_id for player in nearby],
+            "ball_speed": float(np.linalg.norm(self.ball.velocity)),
+        })
+
+    def _can_attempt_move_touch(self, actor: Player) -> bool:
+        if actor.distance_to(self.ball.position) > self._ball_interaction_radius(self.params.move_touch_radius):
+            return False
+        distances = sorted(
+            (player.distance_to(self.ball.position), player.player_id)
+            for player in self.players
+        )
+        if not distances:
+            return False
+        best_dist, best_id = distances[0]
+        actor_dist = actor.distance_to(self.ball.position)
+        if best_id == actor.player_id:
+            return True
+        return actor_dist - best_dist <= 0.03 and best_id.startswith(actor.team)
+
     def _build_state(self) -> Dict:
         return {
             "step": self.step_count,
@@ -576,3 +687,44 @@ class HyperGymSimulation:
             "winner": self.winner,
             "players": [player.copy_public_state() for player in self.players],
         }
+
+    def _refresh_ball_control(self, step_events: List[Dict], *, emit_events: bool) -> None:
+        previous_owner_id = self.ball.owner_id
+        previous_owner = self._ball_owner()
+        ball_speed = float(np.linalg.norm(self.ball.velocity))
+        if previous_owner is not None:
+            release_radius = self._ball_interaction_radius(self.params.control_release_radius)
+            if previous_owner.distance_to(self.ball.position) > release_radius or ball_speed > self.params.trap_safe_speed:
+                self.ball.owner_id = None
+
+        if self.ball.owner_id is None and ball_speed <= self.params.trap_stop_speed:
+            capture_radius = self._ball_interaction_radius(self.params.control_capture_radius)
+            candidates = [
+                player
+                for player in self.players
+                if player.distance_to(self.ball.position) <= capture_radius
+            ]
+            if candidates:
+                candidates.sort(key=lambda player: (player.distance_to(self.ball.position), 0 if player.team == "home" else 1))
+                best = candidates[0]
+                if len(candidates) == 1:
+                    self.ball.owner_id = best.player_id
+                else:
+                    second_dist = candidates[1].distance_to(self.ball.position)
+                    if second_dist - best.distance_to(self.ball.position) > 0.08:
+                        self.ball.owner_id = best.player_id
+
+        for player in self.players:
+            player.has_ball = self.ball.owner_id == player.player_id
+
+        if emit_events and previous_owner_id != self.ball.owner_id:
+            if previous_owner_id is not None and self.ball.owner_id is None:
+                step_events.append({"event_type": "ball_control_lost", "from_player": previous_owner_id})
+            elif previous_owner_id is None and self.ball.owner_id is not None:
+                step_events.append({"event_type": "ball_control_gained", "to_player": self.ball.owner_id})
+            elif previous_owner_id is not None and self.ball.owner_id is not None:
+                step_events.append({
+                    "event_type": "turnover",
+                    "from_player": previous_owner_id,
+                    "to_player": self.ball.owner_id,
+                })

@@ -126,6 +126,7 @@ def build_match_controller(
     wall_restitution: float = 1.0,
     ball_speed: float = 0.55,
     dribble_speed: float = 0.12,
+    end_on_ball_out: bool = False,
 ) -> HyperGymController:
     simulation = HyperGymSimulation(
         num_home=num_home,
@@ -135,6 +136,7 @@ def build_match_controller(
             wall_restitution=wall_restitution,
             ball_speed=ball_speed,
             dribble_speed=dribble_speed,
+            end_on_ball_out=end_on_ball_out,
         ),
         seed=seed,
     )

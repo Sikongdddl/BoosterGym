@@ -236,9 +236,6 @@ def _draw_entities(
         outline = EGO_MARKER_COLOR if player["player_id"] == ego_player_id else (255, 255, 255)
         outline_w = 4 if player["player_id"] == ego_player_id else 2
         draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=fill, outline=outline, width=outline_w)
-        if player["has_ball"]:
-            halo = radius + 6
-            draw.ellipse((px - halo, py - halo, px + halo, py + halo), outline=BALL_COLOR, width=3)
         label = player["player_id"]
         if player["player_id"] == ego_player_id:
             label += " [ego]"
@@ -372,9 +369,6 @@ def _draw_first_person_entities(
         outline = EGO_MARKER_COLOR if player["player_id"] == ego_player["player_id"] else (255, 255, 255)
         outline_w = 4 if player["player_id"] == ego_player["player_id"] else 2
         draw.ellipse((screen_x - radius, screen_y - radius, screen_x + radius, screen_y + radius), fill=fill, outline=outline, width=outline_w)
-        if player["has_ball"]:
-            halo = radius + 5
-            draw.ellipse((screen_x - halo, screen_y - halo, screen_x + halo, screen_y + halo), outline=BALL_COLOR, width=3)
         label = player["player_id"]
         if player["player_id"] == ego_player["player_id"]:
             label += " [ego]"
