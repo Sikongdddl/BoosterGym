@@ -162,6 +162,8 @@ class HyperGymSimulation:
     def step(self, action: Dict[str, Any], opponent_action: Dict[str, Any] | None = None) -> Tuple[np.ndarray, float, bool, Dict]:
         self.step_count += 1
         step_events: List[Dict] = []
+        # IMPORTANT: keep ball control as a weak label only.
+        # Downstream VLM experiments assume the ball is never hard-attached to a player during normal updates.
         self._refresh_ball_control(step_events, emit_events=False)
 
         home_action = self._normalize_actions(action, team="home")
@@ -171,6 +173,9 @@ class HyperGymSimulation:
 
         self.prev_actions = dict(self.last_actions)
         self.last_actions = {**home_action, **away_action}
+        # IMPORTANT: this update order is deliberate.
+        # Actions may add impulse-like ball interactions first; physics, contest resolution, and control refresh happen afterwards.
+        # Reordering these stages easily reintroduces sticky control or ball teleport artifacts.
         self._apply_team_actions(home_action, team="home", step_events=step_events)
         self._apply_team_actions(away_action, team="away", step_events=step_events)
         self._resolve_player_collisions(step_events)
@@ -344,6 +349,8 @@ class HyperGymSimulation:
 
         actor.move_towards(target)
         actor.clamp(self.params.field_size)
+        # IMPORTANT: move may nudge the ball, but should never "own" it by snapping it onto the player.
+        # This keeps possession changes observable as collisions/impulses instead of trivial sticky dribbling.
         if self._can_attempt_move_touch(actor):
             if self._should_lose_ball(actor, action_type="move", step_events=step_events):
                 self._apply_loose_ball(actor, target, team, step_events)
@@ -367,6 +374,8 @@ class HyperGymSimulation:
                 return
 
             if self.params.end_on_ball_out:
+                # IMPORTANT: with dead-ball enabled, touching the touchline/goal-line ends play immediately.
+                # Do not let wall bounce happen first, otherwise the simulator hides real out-of-bounds risk.
                 out_info = self._check_ball_out(self.ball.position)
                 if out_info is not None:
                     self.winner = "ball_out"
@@ -580,15 +589,17 @@ class HyperGymSimulation:
             )
             loose_dir = rot @ direction
             loose_speed = self.rng.uniform(*self.params.loose_ball_speed_range)
+            # IMPORTANT: only perform minimal separation before applying new velocity.
+            # Large position jumps here look like ball teleportation on possession changes.
+            self._separate_ball_from_actor(actor, loose_dir)
             self.ball.velocity = loose_dir * float(loose_speed)
-            self.ball.position = self._clip_ball_position(actor.position + loose_dir * (self.params.player_collision_radius + self.ball.radius + 0.03))
             step_events.append({"event_type": "loose_ball", "team": team, "by": actor.player_id, "ball_speed": float(np.linalg.norm(self.ball.velocity))})
         else:
             speed = float(np.linalg.norm(self.ball.velocity))
+            self._separate_ball_from_actor(actor, direction)
             self.ball.velocity = direction * speed * self.params.dead_ball_speed_scale
             if float(np.linalg.norm(self.ball.velocity)) < self.params.trap_stop_speed:
                 self.ball.velocity[:] = 0.0
-            self.ball.position = self._clip_ball_position(actor.position + direction * (self.params.player_collision_radius + self.ball.radius + 0.01))
             step_events.append({"event_type": "dead_ball", "team": team, "by": actor.player_id, "ball_speed": float(np.linalg.norm(self.ball.velocity))})
 
     def _apply_move_touch(self, actor: Player, target: np.ndarray, team: str, step_events: List[Dict]) -> None:
@@ -601,9 +612,10 @@ class HyperGymSimulation:
         self.ball.owner_id = None
         current_speed = float(np.linalg.norm(self.ball.velocity))
         touch_speed = max(current_speed, self.params.move_touch_speed)
+        # IMPORTANT: this is an impulse-style touch, not a reposition-to-foot operation.
+        # Keep separation minimal and let subsequent physics move the ball.
+        self._separate_ball_from_actor(actor, touch_dir)
         self.ball.velocity = touch_dir * float(touch_speed)
-        contact_offset = touch_dir * (self.params.player_collision_radius + self.ball.radius + 0.02)
-        self.ball.position = self._clip_ball_position(actor.position + contact_offset)
         step_events.append({
             "event_type": "move_touch",
             "team": team,
@@ -612,6 +624,8 @@ class HyperGymSimulation:
         })
 
     def _resolve_scramble(self, step_events: List[Dict]) -> None:
+        # IMPORTANT: scramble resolution exists to break unrealistic "dogfights" where several players
+        # grind around a nearly-static ball forever. Preserve the loose-ball nature of the outcome.
         if float(np.linalg.norm(self.ball.velocity)) > self.params.trap_stop_speed:
             return
         nearby = [
@@ -649,10 +663,9 @@ class HyperGymSimulation:
         self.ball.owner_id = None
         for player in self.players:
             player.has_ball = False
+        anchor = min(nearby, key=lambda player: player.distance_to(self.ball.position))
+        self._separate_ball_from_actor(anchor, escape_dir)
         self.ball.velocity = escape_dir * escape_speed
-        self.ball.position = self._clip_ball_position(
-            self.ball.position + escape_dir * (self.params.player_collision_radius + self.ball.radius + 0.04)
-        )
         step_events.append({
             "event_type": "loose_ball_scramble",
             "players": [player.player_id for player in nearby],
@@ -674,6 +687,28 @@ class HyperGymSimulation:
             return True
         return actor_dist - best_dist <= 0.03 and best_id.startswith(actor.team)
 
+    def _separate_ball_from_actor(self, actor: Player, preferred_dir: np.ndarray) -> None:
+        # IMPORTANT: this helper is only for overlap resolution.
+        # It must never be turned into a generic "place ball in front of player" utility.
+        min_dist = self.ball.radius + self.params.player_collision_radius + 0.01
+        direction = np.asarray(preferred_dir, dtype=np.float32)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-8:
+            delta = self.ball.position - actor.position
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm > 1e-8:
+                direction = delta / delta_norm
+            else:
+                direction = np.asarray([1.0, 0.0], dtype=np.float32)
+        else:
+            direction = direction / norm
+
+        delta = self.ball.position - actor.position
+        dist = float(np.linalg.norm(delta))
+        if dist >= min_dist:
+            return
+        self.ball.position = self._clip_ball_position(actor.position + direction * min_dist)
+
     def _build_state(self) -> Dict:
         return {
             "step": self.step_count,
@@ -689,6 +724,9 @@ class HyperGymSimulation:
         }
 
     def _refresh_ball_control(self, step_events: List[Dict], *, emit_events: bool) -> None:
+        # IMPORTANT: ball_owner_id / has_ball are weak observational labels for policies and rendering.
+        # They are not allowed to drive the ball's physical position, otherwise the simulator collapses back
+        # to the old sticky-control regime that invalidated prior experiments.
         previous_owner_id = self.ball.owner_id
         previous_owner = self._ball_owner()
         ball_speed = float(np.linalg.norm(self.ball.velocity))

@@ -91,6 +91,14 @@ def _to_plain(value: Any) -> Any:
     return value
 
 
+def _ball_front_offset_for_player(player) -> np.ndarray:
+    heading = float(getattr(player, "heading", 0.0))
+    direction = np.asarray([np.cos(heading), np.sin(heading)], dtype=np.float32)
+    if float(np.linalg.norm(direction)) < 1e-8:
+        direction = np.asarray([1.0 if player.team == "home" else -1.0, 0.0], dtype=np.float32)
+    return direction
+
+
 def _state_text_summary(state: Dict[str, Any], recent_events: List[Dict[str, Any]]) -> str:
     ball = np.asarray(state["ball_position"], dtype=np.float32)
     ball_vel = np.asarray(state.get("ball_velocity", [0.0, 0.0]), dtype=np.float32)
@@ -546,7 +554,9 @@ def _set_manual_state(simulation, state_spec: Dict[str, Any]) -> Dict[str, Any]:
         for player in simulation.players:
             player.has_ball = player.player_id == owner_id
             if player.player_id == owner_id:
-                simulation.ball.position = player.position.copy()
+                front = _ball_front_offset_for_player(player)
+                separation = simulation.params.player_collision_radius + simulation.ball.radius + 0.02
+                simulation.ball.position = simulation._clip_ball_position(player.position + front * separation)
                 simulation.ball.velocity[:] = 0.0
     return simulation.get_state()
 
@@ -672,7 +682,7 @@ def _default_benchmark_cases() -> List[BenchmarkCase]:
             expected_target_note="Target should bias toward home_1 or the right attacking half-space.",
             state_spec={
                 "step": 32,
-                "ball_position": [5.80, 2.70],
+                "ball_position": [6.15, 2.70],
                 "ball_velocity": [0.0, 0.0],
                 "ball_owner_id": "home_0",
                 "players": [
