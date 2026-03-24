@@ -34,6 +34,8 @@ OBSERVATION_MODES = {
 }
 
 DEFAULT_VISION_VIEW = "global"
+DEFAULT_VLM_MODEL = "qwen3vl"
+DEFAULT_VLM_BASE_URL = "https://models.sjtu.edu.cn/api/v1"
 
 
 @dataclass
@@ -173,10 +175,11 @@ def _make_render_record(
 class OpenAICompatibleVisionVLM:
     """OpenAI-compatible vision client with a constrained tactic prompt."""
 
-    def __init__(self, model: str, api_key: str, base_url: str):
+    def __init__(self, model: str, api_key: str, base_url: str, timeout_seconds: float = 30.0):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = float(timeout_seconds)
 
     def decide(self, state: Dict[str, Any], state_text: str, image_path: Path, vision_view: str) -> Dict[str, Any]:
         field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
@@ -253,7 +256,7 @@ class OpenAICompatibleVisionVLM:
         )
 
         try:
-            with url_request.urlopen(request_obj, timeout=30) as response:
+            with url_request.urlopen(request_obj, timeout=self.timeout_seconds) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except url_error.HTTPError as exc:
             detail = ""
@@ -404,11 +407,18 @@ def _team_decision_to_action(team_decision: TeamVLMDecision) -> Dict[str, Any]:
     }
 
 
-def _build_vlm(model: str, base_url: str) -> Any:
+def _get_vlm_api_key() -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("未设置 OPENAI_API_KEY")
-    return OpenAICompatibleVisionVLM(model=model, api_key=api_key, base_url=base_url)
+    if api_key:
+        return api_key
+    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    if api_key:
+        return api_key
+    raise RuntimeError("未设置 OPENAI_API_KEY 或 DASHSCOPE_API_KEY")
+
+
+def _build_vlm(model: str, base_url: str) -> Any:
+    return OpenAICompatibleVisionVLM(model=model, api_key=_get_vlm_api_key(), base_url=base_url)
 
 
 def _save_artifact(
@@ -1186,14 +1196,14 @@ def main() -> None:
     parser.add_argument(
         "--vlm-model",
         type=str,
-        default="qwen3vl",
+        default=DEFAULT_VLM_MODEL,
         help="OpenAI 兼容视觉模型名",
     )
     parser.add_argument(
         "--vlm-base-url",
         type=str,
-        default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        help="OpenAI 兼容 API 基地址，例如 https://xxx/v1",
+        default=os.getenv("OPENAI_BASE_URL", DEFAULT_VLM_BASE_URL),
+        help="OpenAI 兼容 API 基地址，例如百炼的 https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     parser.add_argument(
         "--save-artifacts-dir",

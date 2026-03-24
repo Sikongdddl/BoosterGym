@@ -23,6 +23,7 @@ runner:
 viewer:
   pos: [3., -3., 2.]  # [m]
   lookat: [0., 0., 0.]  # [m]
+  capture_for_policy: false  # if true, keep graphics in headless for BaseTask.capture_policy_frame
   record_video: false  # only in play
   record_interval: 5.  # [s]
   record_env_idx: 0

@@ -34,6 +34,20 @@ oracle correctness 采样帧，可视为一般情况。
 | 视角差异（BEV vs ego） | BEV 基线，`0.7111 / 0.5556` | BEV 基线，`0.5333 / 0.3333` | 与对应 BEV 基线几乎相同 | 相对对应 BEV 基线略好，但差异小于“有无状态文本”的差异 |
 | 当前解读 | 当前最支持“状态文本比视角变化更重要” | 同左 | 同左 | 同左，但这一轮仍受较高 fallback/timeout 污染，只能视为方向性证据 |
 
+### 图像源对照
+
+在同一批 oracle 采样帧、同一份状态文本、同一份 scripted oracle 标签下，只替换图像来源：
+
+- `HyperGym BEV map`
+- `IsaacGym top-down RGB`
+
+| 观察 | HyperGym BEV + 状态数值文本 | IsaacGym top-down + 状态数值文本 |
+| --- | --- | --- |
+| 相对 scripted oracle 的正确性 | `policy_accuracy=0.8611`，`step_exact_match_rate=0.7222` | `policy_accuracy=0.9167`，`step_exact_match_rate=0.8333` |
+| 目标点误差 | `target_hit_rate=0.7222`，`mean_target_error=0.6221` | `target_hit_rate=0.6111`，`mean_target_error=0.8701` |
+| VLM 输出本身是否变化 | 基线 | 相对 HyperGym 图像有明显变化：`16/18` 个样本、`19/36` 个球员预测发生变化 |
+| 当前解读 | HyperGym 图像下，VLM 更接近原先那条 oracle correctness 评测链 | Isaac 图像会显著改变 VLM 的策略输出；在这批样本上它反而提高了动作类别匹配率，但目标点更偏 |
+
 当前实验表明，在一般 oracle 采样帧上，去掉状态文本和把 BEV 换成 ego 视角都几乎不影响结果；但在专门构造的困难视觉 case 上，一旦不给状态文本，无论 BEV 还是 ego 都明显失败。也就是说，当前主要瓶颈不是 ego 视角本身，而是 VLM 在纯图像条件下处理高难战术空间关系的能力不足。
 
 - 记录时间：2026-03-17 17:20:10 CST
@@ -668,3 +682,80 @@ OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
 - `no_state + BEV`: [scenario_suite_small_global_image_only.json](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/scenario_suite_small_global_image_only.json)
 - `state + ego`: [scenario_suite_small_ego_fp_home_0_state_text.json](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/scenario_suite_small_ego_fp_home_0_state_text.json)
 - `no_state + ego`: [scenario_suite_small_ego_fp_home_0_image_only.json](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/scenario_suite_small_ego_fp_home_0_image_only.json)
+
+## Ablation 007
+
+### Question
+
+如果复刻原来的 oracle correctness 状态集合和状态文本，只把图像输入从 `HyperGym BEV map` 换成 `IsaacGym top-down RGB`，VLM 输出会不会发生明显变化？
+
+### Compared Conditions
+
+- `hyper_bev + image_with_state_text`
+- `isaac_topdown + image_with_state_text`
+
+### Shared Evaluation Setup
+
+- 固定轨迹 seed：`[7, 8, 9]`
+- `episodes = 3`
+- `max_steps = 30`
+- `samples_per_episode = 6`
+- `num_home = 2`
+- `num_away = 2`
+- 总样本数：`18`
+- 总球员动作预测数：`36`
+- 状态文本：和原 oracle correctness 实验相同
+- 唯一变化：图像来源
+
+### Results
+
+| Condition | policy_accuracy | step_exact_match_rate | target_hit_rate | mean_target_error |
+| --- | ---: | ---: | ---: | ---: |
+| `hyper_bev + image_with_state_text` | `0.8611` | `0.7222` | `0.7222` | `0.6221` |
+| `isaac_topdown + image_with_state_text` | `0.9167` | `0.8333` | `0.6111` | `0.8701` |
+
+### Direct Output Difference
+
+不只是相对 oracle 的指标不同，VLM 输出本身也明显变了：
+
+- `16 / 18` 个样本至少有一个球员预测发生变化
+- `19 / 36` 个球员预测发生变化
+
+典型变化包括：
+
+- 原来同样是 `move_to_target`，但 target 点改了
+- 一些 `move_to_target` 和 `trap_ball` 之间发生了切换
+
+### Interpretation
+
+这组结果说明：
+
+- 把图像源从 `HyperGym BEV` 换成 `IsaacGym RGB`，确实会显著改变 VLM 输出
+- 而且这种变化不是小抖动，因为它影响到了过半样本
+- 在这批样本上，`Isaac top-down` 反而提高了动作类别匹配率
+- 但目标点更偏，说明它更容易选对“大类动作”，不一定更接近 oracle 的具体落点
+
+更谨慎的说法是：
+
+- 图像域变化已经成为有效变量
+- 当前 VLM 对图像表现形式并不鲁棒
+- 同一底层局面，换一种视觉渲染风格后，它的高层策略会发生可观变化
+
+这里需要强调一个解释边界：
+
+- `target` 并不是唯一标准答案
+- scripted oracle 给出的 target 只是“其中一种可行战术落点”，不是唯一正确解
+
+因此在这组对照里，`policy_accuracy` 和 `step_exact_match_rate` 的解释权重应当高于 target 误差。换句话说：
+
+- 如果 `Isaac top-down` 让 VLM 更频繁地选中了和 oracle 相同的策略类别
+- 即使 target 点和 oracle 的几何误差更大
+
+这仍然说明“把图像输入从 HyperGym BEV map 换成 IsaacGym RGB”是有道理的，而且很可能更接近你真正想测试的视觉输入形态。
+
+### Artifacts
+
+- HyperGym 结果 JSON: [oracle_image_source_hyper_bev_state_text_seed789.json](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/oracle_image_source_hyper_bev_state_text_seed789.json)
+- IsaacGym 结果 JSON: [oracle_image_source_isaac_topdown_state_text_seed789.json](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/oracle_image_source_isaac_topdown_state_text_seed789.json)
+- HyperGym artifact 目录: [oracle_image_source_hyper_bev_state_text_seed789](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/oracle_image_source_hyper_bev_state_text_seed789)
+- IsaacGym artifact 目录: [oracle_image_source_isaac_topdown_state_text_seed789](/home/ubuntu/jrWork/booster_gym/logs/vlm_poc/oracle_image_source_isaac_topdown_state_text_seed789)

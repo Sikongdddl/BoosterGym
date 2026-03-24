@@ -23,7 +23,10 @@ from scripts.vlm_policy_poc import _query_vlm_on_record
 from scripts.vlm_policy_poc import _set_manual_state
 from scripts.vlm_policy_poc import _state_text_summary
 from scripts.vlm_policy_poc import _to_plain
+from scripts.vlm_policy_poc import _get_vlm_api_key
 from scripts.vlm_policy_poc import OBSERVATION_MODES
+from scripts.vlm_policy_poc import DEFAULT_VLM_BASE_URL
+from scripts.vlm_policy_poc import DEFAULT_VLM_MODEL
 from scripts.vlm_policy_poc import OpenAICompatibleVisionVLM
 
 
@@ -36,10 +39,7 @@ SKILL_TO_POLICY_ID = {
 
 
 def _build_vlm(model: str, base_url: str) -> OpenAICompatibleVisionVLM:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("未设置 OPENAI_API_KEY")
-    return OpenAICompatibleVisionVLM(model=model, api_key=api_key, base_url=base_url)
+    return OpenAICompatibleVisionVLM(model=model, api_key=_get_vlm_api_key(), base_url=base_url)
 
 
 def _euclidean(a: Any, b: Any) -> float:
@@ -370,11 +370,11 @@ def main() -> None:
     parser.add_argument("--num-home", type=int, default=2, help="home team player count")
     parser.add_argument("--num-away", type=int, default=2, help="away team player count")
     parser.add_argument("--target-threshold", type=float, default=0.75, help="meters for target-hit metric")
-    parser.add_argument("--vlm-model", type=str, default="qwen3vl", help="vision model name")
+    parser.add_argument("--vlm-model", type=str, default=DEFAULT_VLM_MODEL, help="vision model name")
     parser.add_argument(
         "--vlm-base-url",
         type=str,
-        default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        default=os.getenv("OPENAI_BASE_URL", DEFAULT_VLM_BASE_URL),
         help="OpenAI-compatible API base url",
     )
     parser.add_argument(

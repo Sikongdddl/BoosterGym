@@ -27,6 +27,8 @@
   当前的轻量 reward 逻辑
 - [data_interface.py](/home/ubuntu/jrWork/booster_gym/envs/hyperGym/data_interface.py)
   observation 组装
+- [isaac_wrapper.py](/home/ubuntu/jrWork/booster_gym/envs/hyperGym/isaac_wrapper.py)
+  将 IsaacGym 仿真张量投影为 HyperGym 风格的 `state` / `record`（供 HyperGym 策略或 `render_record` 复用，无需从 RGB 解析场景）
 
 ## 动作接口
 

@@ -20,7 +20,8 @@ if str(ROOT) not in sys.path:
 
 from envs.hyperGym.main import build_match_controller
 from envs.hyperGym.renderer import render_episode_mp4, render_record
-from scripts.vlm_policy_poc import _clip_target, _make_render_record, _save_artifact, _to_plain
+from scripts.vlm_policy_poc import _clip_target, _get_vlm_api_key, _make_render_record, _save_artifact, _to_plain
+from scripts.vlm_policy_poc import DEFAULT_VLM_BASE_URL, DEFAULT_VLM_MODEL
 
 
 ALLOWED_POLICY_IDS = {
@@ -321,10 +322,7 @@ def _team_decision_to_action(team_decision: TeamVLMDecision) -> Dict[str, Any]:
 
 
 def _build_vlm(model: str, base_url: str) -> OpenAICompatibleVisionVLM:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("未设置 OPENAI_API_KEY")
-    return OpenAICompatibleVisionVLM(model=model, api_key=api_key, base_url=base_url)
+    return OpenAICompatibleVisionVLM(model=model, api_key=_get_vlm_api_key(), base_url=base_url)
 
 
 def _query_team_vlm(
@@ -541,8 +539,8 @@ def main() -> None:
     parser.add_argument("--num-away", type=int, default=1)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--query-interval", type=int, default=1)
-    parser.add_argument("--vlm-model", type=str, default="qwen3vl")
-    parser.add_argument("--vlm-base-url", type=str, default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    parser.add_argument("--vlm-model", type=str, default=DEFAULT_VLM_MODEL)
+    parser.add_argument("--vlm-base-url", type=str, default=os.getenv("OPENAI_BASE_URL", DEFAULT_VLM_BASE_URL))
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--save-json", type=str, default="")
     args = parser.parse_args()

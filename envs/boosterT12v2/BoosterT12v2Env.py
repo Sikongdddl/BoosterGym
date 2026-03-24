@@ -3,7 +3,7 @@ from typing import Dict
 import numpy as np
 import torch
 from isaacgym import gymtorch
-from isaacgym.torch_utils import get_axis_params, quat_rotate, quat_rotate_inverse, to_torch
+from isaacgym.torch_utils import get_axis_params, quat_from_euler_xyz, quat_rotate, quat_rotate_inverse, to_torch
 
 from envs.components.MidLevelPolicyManager import MidLevelPolicyManager
 from envs.components.MultiAgentLowLevelController import MultiAgentLowLevelController
@@ -134,6 +134,75 @@ class BoosterT12v2Env:
         self._refresh_state_tensors()
         self._compute_locomotion_obs()
         return self.obs_buf, self.extras
+
+    def set_from_hyper_state(self, state: Dict):
+        state_field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
+        sim_field_cfg = self.game_cfg.get("field", {})
+        sim_field = np.asarray(
+            [
+                float(sim_field_cfg.get("length", 14.0)),
+                float(sim_field_cfg.get("width", 9.0)),
+            ],
+            dtype=np.float32,
+        )
+
+        def map_xy(xy):
+            arr = np.asarray(xy, dtype=np.float32)
+            nx = 0.0 if state_field[0] <= 1e-6 else float(arr[0]) / float(state_field[0])
+            ny = 0.0 if state_field[1] <= 1e-6 else float(arr[1]) / float(state_field[1])
+            wx = (nx - 0.5) * float(sim_field[0])
+            wy = (ny - 0.5) * float(sim_field[1])
+            return wx, wy
+
+        def map_vel(vxy):
+            arr = np.asarray(vxy, dtype=np.float32)
+            sx = float(sim_field[0]) / max(float(state_field[0]), 1e-6)
+            sy = float(sim_field[1]) / max(float(state_field[1]), 1e-6)
+            return float(arr[0]) * sx, float(arr[1]) * sy
+
+        self.controller.reset_robots(
+            self.root_states, self.root_states_robot, self.dof_pos, self.dof_vel, self.dof_state, self.default_dof_pos
+        )
+        self.controller.reset_ball(self.root_states)
+
+        players = state.get("players", [])
+        if len(players) != self.num_players:
+            raise ValueError(f"Expected {self.num_players} players, got {len(players)}")
+
+        for idx, player in enumerate(players):
+            wx, wy = map_xy(player.get("position", [0.0, 0.0]))
+            vx, vy = map_vel(player.get("velocity", [0.0, 0.0]))
+            yaw = float(player.get("heading", 0.0))
+            quat = quat_from_euler_xyz(
+                torch.tensor([0.0], device=self.controller.device),
+                torch.tensor([0.0], device=self.controller.device),
+                torch.tensor([yaw], device=self.controller.device),
+            )[0]
+            self.root_states_robot[idx, 0] = wx
+            self.root_states_robot[idx, 1] = wy
+            self.root_states_robot[idx, 2] = float(self.controller.base_init_state[2].item())
+            self.root_states_robot[idx, 3:7] = quat
+            self.root_states_robot[idx, 7] = vx
+            self.root_states_robot[idx, 8] = vy
+            self.root_states_robot[idx, 9:13] = 0.0
+
+        ball_pos = state.get("ball_position", [0.0, 0.0])
+        ball_vel = state.get("ball_velocity", [0.0, 0.0])
+        bwx, bwy = map_xy(ball_pos)
+        bvx, bvy = map_vel(ball_vel)
+        self.root_states[self.ball_actor_index, 0] = bwx
+        self.root_states[self.ball_actor_index, 1] = bwy
+        self.root_states[self.ball_actor_index, 2] = self.ball_default_z
+        self.root_states[self.ball_actor_index, 3:7] = 0.0
+        self.root_states[self.ball_actor_index, 6] = 1.0
+        self.root_states[self.ball_actor_index, 7] = bvx
+        self.root_states[self.ball_actor_index, 8] = bvy
+        self.root_states[self.ball_actor_index, 9:13] = 0.0
+
+        self.controller.gym.set_actor_root_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(self.root_states))
+        self.controller.gym.set_dof_state_tensor(self.controller.sim, gymtorch.unwrap_tensor(self.dof_state))
+        self._refresh_state_tensors()
+        self._compute_locomotion_obs()
 
     def _refresh_state_tensors(self):
         self.controller.gym.refresh_actor_root_state_tensor(self.controller.sim)

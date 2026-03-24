@@ -244,12 +244,25 @@ def create_humanoid_adult_field(self, env_handle, field_cfg):
     goal_height = float(field_cfg["goal_height"])
     border_strip_width = float(field_cfg.get("border_strip_width", 1.0))
     add_grass = bool(field_cfg.get("enable_grass_strips", False))
+    add_ground_patch = bool(field_cfg.get("enable_ground_patch", True))
     add_goals = bool(field_cfg.get("enable_goals", True))
 
     white = gymapi.Vec3(1.0, 1.0, 1.0)
     goal_left = gymapi.Vec3(0.35, 0.65, 1.0)
     goal_right = gymapi.Vec3(1.0, 0.82, 0.35)
+    pitch_green = gymapi.Vec3(0.18, 0.52, 0.18)
     count = 0
+
+    if add_ground_patch:
+        _create_fixed_box_actor(
+            self,
+            env_handle,
+            (length + 2 * border_strip_width, width + 2 * border_strip_width, 0.01),
+            (0.0, 0.0, 0.005),
+            "pitch_ground_patch",
+            pitch_green,
+        )
+        count += 1
 
     if add_grass:
         count += create_strip_grass(self, env_handle, length=length + 2 * border_strip_width, width=width + 2 * border_strip_width, num_strips=10)
