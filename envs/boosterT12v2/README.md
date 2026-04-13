@@ -30,9 +30,9 @@
 - `Runner.boosterT12v2()` 的最小启动入口
 - `Runner.boosterT12v2Locomotion()` 的低层运动 smoke test
 - `Runner.boosterT12v2PolicyBridge()` 的 `policy_id + target -> midlevel -> command` smoke test
-- 默认会通过 `basic.checkpoint: -1` 自动加载 `logs/low/**/*.pth` 下最新的低层 locomotion 权重
-- `move_to_target` 当前默认从 `logs/ckpt/chaseBall/*.pt` 自动找最新 midlevel policy
-- `pass_to_target` 当前默认从 `logs/ckpt/passBall/sac/*.pt` 自动找最新 midlevel policy
+- 默认会通过 `basic.checkpoint: -1` 自动加载 `core/checkpoints/low_level/**/*.pth` 下最新的低层 locomotion 权重；旧 `logs/low/**/*.pth` 路径只作为兼容 fallback
+- `move_to_target` 当前默认从 `core/checkpoints/mid_level/chaseBall/*.pt` 自动找最新 midlevel policy
+- `pass_to_target` 当前默认从 `core/checkpoints/mid_level/passBall/sac/*.pt` 自动找最新 midlevel policy
 
 ## 当前未完成
 

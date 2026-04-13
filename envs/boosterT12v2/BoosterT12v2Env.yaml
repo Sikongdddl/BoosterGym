@@ -179,10 +179,10 @@ midlevel:
   policies:
     move_to_target:
       checkpoint: null
-      glob: "logs/ckpt/chaseBall/*.pt"
+      glob: "core/checkpoints/mid_level/chaseBall/*.pt"
     pass_to_target:
       checkpoint: null
-      glob: "logs/ckpt/passBall/sac/*.pt"
+      glob: "core/checkpoints/mid_level/passBall/sac/*.pt"
     trap_ball:
       checkpoint: null
       glob: null

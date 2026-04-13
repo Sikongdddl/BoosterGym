@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--save-dir", type=str, default="logs/bc_policy")
+    parser.add_argument("--save-dir", type=str, default="core/checkpoints/high_level/bc/run")
     parser.add_argument("--init-checkpoint", type=str, default="", help="Optional checkpoint path to resume or initialize from.")
     args = parser.parse_args()
 

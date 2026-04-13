@@ -34,3 +34,8 @@ Follow these steps to set up your environment:
 3. Exit Safely:
 
     Switch back to PREP Mode before terminating the program to safely release control.
+This directory is reserved for the legacy deployment path and real-robot facing assets.
+
+Reusable project checkpoints now live under:
+
+- [core/checkpoints](/home/ubuntu/jrWork/booster_gym/core/checkpoints)

@@ -7,6 +7,8 @@ videos/
 videos/**
 datasets/
 datasets/**
+core/checkpoints/
+core/checkpoints/**
 
 # python cache
 __pycache__/

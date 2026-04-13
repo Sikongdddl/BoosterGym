@@ -8,6 +8,7 @@ import time
 import torch
 
 from utils.model import ActorCritic
+from utils.checkpoints import resolve_low_level_checkpoint
 from envs import *
 from core.agents.sac.agent import SACAgent
 from core.utils.logger import TBLogger
@@ -74,16 +75,10 @@ class Runner:
         torch.cuda.manual_seed_all(self.cfg["basic"]["seed"])
 
     def _load(self):
-        ckpt = self.cfg["basic"].get("checkpoint",None)
+        ckpt = resolve_low_level_checkpoint(self.cfg["basic"].get("checkpoint", None))
         if not ckpt:
             return
-        if ckpt == "-1" or ckpt == -1:
-            all_ckpts = sorted(glob.glob(os.path.join("logs/low", "**/*.pth"), recursive=True), key=os.path.getmtime)
-            if not all_ckpts:
-                print("[WARN] No checkpoint found under logs/**.pth; skip loading.")
-                return
-            ckpt = all_ckpts[-1]
-            self.cfg["basic"]["checkpoint"] = ckpt
+        self.cfg["basic"]["checkpoint"] = ckpt
         print(f"Loading low-level model from {ckpt}")
         model_dict = torch.load(ckpt, map_location=self.device, weights_only=True)
         self.model.load_state_dict(model_dict["model"], strict=False)

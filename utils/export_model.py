@@ -4,6 +4,7 @@ import yaml
 import argparse
 import torch
 from utils.model import *
+from utils.checkpoints import resolve_low_level_checkpoint
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -17,8 +18,9 @@ if __name__ == "__main__":
         cfg["basic"]["checkpoint"] = args.checkpoint
 
     model = ActorCritic(cfg["env"]["num_actions"], cfg["env"]["num_observations"], cfg["env"]["num_privileged_obs"])
-    if not cfg["basic"]["checkpoint"] or (cfg["basic"]["checkpoint"] == "-1") or (cfg["basic"]["checkpoint"] == -1):
-        cfg["basic"]["checkpoint"] = sorted(glob.glob(os.path.join("logs", "**/*.pth"), recursive=True), key=os.path.getmtime)[-1]
+    cfg["basic"]["checkpoint"] = resolve_low_level_checkpoint(cfg["basic"]["checkpoint"])
+    if not cfg["basic"]["checkpoint"]:
+        raise FileNotFoundError("No checkpoint found for export.")
     print("Loading model from {}".format(cfg["basic"]["checkpoint"]))
     model_dict = torch.load(cfg["basic"]["checkpoint"], map_location="cpu", weights_only=True)
     model.load_state_dict(model_dict["model"])
