@@ -6,5 +6,5 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.runner import Runner
 
 if __name__ == "__main__":
-    runner = Runner(test=False)
+    runner = Runner(test=False, task_name="passBall")
     runner.passBall()

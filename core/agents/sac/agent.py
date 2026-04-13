@@ -76,7 +76,7 @@ class SACAgent(BaseAgent):
         if len(self.replay_buffer) < self.batch_size:
             return False, None
 
-        s, a, r, s2, d = self.replay_buffer.sample(self.batch_size)
+        s, a, r, s2, d, notes = self.replay_buffer.sample(self.batch_size)
         s   = torch.as_tensor(s, dtype=torch.float32, device=self.device)
         a   = torch.as_tensor(a, dtype=torch.float32, device=self.device)
         r   = torch.as_tensor(r, dtype=torch.float32, device=self.device).unsqueeze(1)
@@ -128,7 +128,7 @@ class SACAgent(BaseAgent):
 
         # 返回一个标量 loss 便于 TB 记录
         total_loss = (q1_loss + q2_loss + pi_loss).item()
-        return True, total_loss
+        return True, q1_loss.item(), q2_loss.item(), pi_loss.item(), alpha_loss.item(), alpha.item()
 
     @torch.no_grad()
     def _soft_update(self, online, target):

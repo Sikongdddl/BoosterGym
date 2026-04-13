@@ -1,0 +1,21 @@
+[scenario-dataset] family=near_goal_finishing ep=0 seed=15000 steps=2 winner=None home_fb=0 away_fb=2
+[scenario-dataset] family=near_goal_finishing ep=1 seed=15001 steps=11 winner=None home_fb=3 away_fb=5
+[scenario-dataset] family=near_goal_finishing ep=2 seed=15002 steps=6 winner=None home_fb=1 away_fb=1
+[scenario-dataset] family=near_goal_finishing ep=3 seed=15003 steps=3 winner=None home_fb=2 away_fb=2
+[scenario-dataset] family=near_goal_finishing ep=4 seed=15004 steps=6 winner=None home_fb=1 away_fb=0
+[scenario-dataset] family=near_goal_finishing ep=5 seed=15005 steps=5 winner=None home_fb=1 away_fb=0
+[scenario-dataset] family=near_goal_finishing ep=6 seed=15006 steps=10 winner=None home_fb=2 away_fb=3
+[scenario-dataset] family=near_goal_finishing ep=7 seed=15007 steps=7 winner=None home_fb=4 away_fb=1
+[scenario-dataset] family=near_goal_finishing ep=8 seed=15008 steps=12 winner=None home_fb=5 away_fb=3
+[scenario-dataset] family=near_goal_finishing ep=9 seed=15009 steps=12 winner=None home_fb=3 away_fb=0
+[scenario-dataset] family=near_goal_finishing ep=10 seed=15010 steps=8 winner=None home_fb=2 away_fb=2
+[scenario-dataset] family=near_goal_finishing ep=11 seed=15011 steps=2 winner=None home_fb=0 away_fb=0
+[scenario-dataset] family=near_goal_finishing ep=12 seed=15012 steps=14 winner=None home_fb=1 away_fb=2
+[scenario-dataset] family=near_goal_finishing ep=13 seed=15013 steps=17 winner=None home_fb=1 away_fb=3
+[scenario-dataset] family=near_goal_finishing ep=14 seed=15014 steps=8 winner=None home_fb=3 away_fb=4
+[scenario-dataset] family=near_goal_finishing ep=15 seed=15015 steps=12 winner=None home_fb=1 away_fb=3
+[scenario-dataset] family=near_goal_finishing ep=16 seed=15016 steps=12 winner=None home_fb=3 away_fb=2
+[scenario-dataset] family=near_goal_finishing ep=17 seed=15017 steps=2 winner=None home_fb=0 away_fb=1
+[scenario-dataset] family=near_goal_finishing ep=18 seed=15018 steps=9 winner=None home_fb=1 away_fb=1
+[scenario-dataset] family=near_goal_finishing ep=19 seed=15019 steps=4 winner=None home_fb=0 away_fb=0
+[scenario-dataset] completed family=near_goal_finishing episodes=20

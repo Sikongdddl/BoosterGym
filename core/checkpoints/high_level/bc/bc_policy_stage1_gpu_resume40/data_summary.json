@@ -1,0 +1,37 @@
+{
+  "train_summary": {
+    "num_samples": 91599,
+    "team_counts": {
+      "home": 46323,
+      "away": 45276
+    },
+    "skill_counts": {
+      "move": 101461,
+      "pass": 0,
+      "trap": 81737
+    },
+    "fallback_samples": 0,
+    "all_vlm_samples": 91599,
+    "query_step_samples": 48844,
+    "obs_dim": 29
+  },
+  "val_summary": {
+    "num_samples": 10020,
+    "team_counts": {
+      "home": 5067,
+      "away": 4953
+    },
+    "skill_counts": {
+      "move": 11169,
+      "pass": 0,
+      "trap": 8871
+    },
+    "fallback_samples": 0,
+    "all_vlm_samples": 10020,
+    "query_step_samples": 5384,
+    "obs_dim": 29
+  },
+  "dataset_roots": [
+    "datasets/vlm_vs_vlm_qwen3vl_2v2_deadball_ep1000"
+  ]
+}

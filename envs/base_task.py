@@ -1,4 +1,5 @@
 import sys
+import numpy as np
 from isaacgym import gymapi, gymutil
 import torch
 from utils.terrain import Terrain
@@ -16,10 +17,30 @@ class BaseTask:
         torch._C._jit_set_profiling_executor(False)
 
         self.set_viewer()
-        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_A, "A")
-        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_D, "D")
-        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_W, "W")
-        self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_S, "S")
+        self.policy_camera = None
+        if self.viewer is not None:
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_A, "A")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_D, "D")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_W, "W")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_S, "S")
+
+    def _configure_lighting(self):
+        viewer_cfg = self.cfg.get("viewer", {})
+        light_cfg = viewer_cfg.get("policy_light")
+        if not light_cfg:
+            return
+        color = light_cfg.get("color", [0.7, 0.7, 0.7])
+        ambient = light_cfg.get("ambient", [0.35, 0.35, 0.35])
+        direction = light_cfg.get("direction", [0.3, 0.2, -1.0])
+        light_index = int(light_cfg.get("index", 0))
+        self.gym.set_light_parameters(
+            self.sim,
+            light_index,
+            gymapi.Vec3(float(color[0]), float(color[1]), float(color[2])),
+            gymapi.Vec3(float(ambient[0]), float(ambient[1]), float(ambient[2])),
+            gymapi.Vec3(float(direction[0]), float(direction[1]), float(direction[2])),
+        )
+
     def create_sim(self):
         """Creates simulation, terrain and evironments"""
         sim_cfg = self.cfg["sim"]
@@ -35,7 +56,11 @@ class BaseTask:
         # graphics device for rendering, -1 for no rendering
         self.headless = self.cfg["basic"]["headless"]
         self.graphics_device_id = self.sim_device_id
-        if self.headless and not self.cfg["viewer"]["record_video"]:
+        viewer_cfg = self.cfg.get("viewer", {})
+        need_graphics = bool(viewer_cfg.get("record_video", False)) or bool(
+            viewer_cfg.get("capture_for_policy", False)
+        )
+        if self.headless and not need_graphics:
             self.graphics_device_id = -1
 
         self.sim_params = gymapi.SimParams()
@@ -80,6 +105,7 @@ class BaseTask:
             raise ValueError(f"Invalid physics engine backend: {sim_cfg['physics_engine']}")
 
         self.sim = self.gym.create_sim(self.sim_device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
+        self._configure_lighting()
 
     def set_viewer(self):
         self.viewer = None
@@ -141,3 +167,90 @@ class BaseTask:
             self.gym.render_all_camera_sensors(self.sim)
             img = self.gym.get_camera_image(self.sim, self.envs[self.cfg["viewer"]["record_env_idx"]], self.camera, gymapi.IMAGE_COLOR)
             self.camera_frames.append(img.reshape(img.shape[0], -1, 4))
+
+    def capture_policy_frame(
+        self,
+        root_states: torch.Tensor,
+        *,
+        env_idx: int = 0,
+        follow_actor_index: int = 0,
+        width: int = 1280,
+        height: int = 720,
+    ) -> np.ndarray:
+        """
+        Headless-safe RGB capture for vision / high-level policy input.
+        Requires viewer.capture_for_policy: true (or record_video) so graphics_device_id stays enabled.
+
+        Args:
+            root_states: Actor root state tensor, shape (num_actors, 13).
+            env_idx: Which IsaacGym env handle to use.
+            follow_actor_index: Row in root_states used as camera look-at (usually first robot).
+            width, height: Camera resolution.
+
+        Returns:
+            uint8 array (H, W, 3) RGB.
+        """
+        if self.graphics_device_id < 0:
+            raise RuntimeError(
+                "capture_policy_frame needs graphics: set viewer.capture_for_policy: true "
+                "(or record_video: true) in YAML when running headless."
+            )
+        if not hasattr(self, "envs") or not self.envs:
+            raise RuntimeError("capture_policy_frame called before envs were created.")
+
+        viewer_cfg = self.cfg.get("viewer", {})
+        policy_camera_mode = str(viewer_cfg.get("policy_camera_mode", "follow_actor")).lower()
+        cam_offset = viewer_cfg.get("pos", [3.0, -3.0, 2.0])
+        if len(cam_offset) < 3:
+            raise ValueError("viewer.pos must have length >= 3")
+
+        if self.policy_camera is None:
+            cam_props = gymapi.CameraProperties()
+            cam_props.width = int(width)
+            cam_props.height = int(height)
+            cam_props.use_collision_geometry = False
+            self.policy_camera = self.gym.create_camera_sensor(self.envs[env_idx], cam_props)
+
+        if self.device != "cpu":
+            self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
+
+        if policy_camera_mode == "topdown_center":
+            center = viewer_cfg.get("policy_camera_center", [0.0, 0.0, 0.0])
+            if len(center) < 3:
+                raise ValueError("viewer.policy_camera_center must have length >= 3")
+            height_offset = float(viewer_cfg.get("policy_camera_height", 12.0))
+            tilt_offset = viewer_cfg.get("policy_camera_tilt_offset", [0.0, -0.5, 0.0])
+            if len(tilt_offset) < 3:
+                raise ValueError("viewer.policy_camera_tilt_offset must have length >= 3")
+            cx = float(center[0])
+            cy = float(center[1])
+            cz = float(center[2])
+            cam_pos = gymapi.Vec3(
+                cx + float(tilt_offset[0]),
+                cy + float(tilt_offset[1]),
+                cz + height_offset + float(tilt_offset[2]),
+            )
+            cam_target = gymapi.Vec3(cx, cy, cz)
+        else:
+            base = root_states[follow_actor_index, 0:3]
+            bx = float(base[0].item())
+            by = float(base[1].item())
+            bz = float(base[2].item())
+            cam_pos = gymapi.Vec3(bx + float(cam_offset[0]), by + float(cam_offset[1]), bz + float(cam_offset[2]))
+            cam_target = gymapi.Vec3(bx, by, bz)
+
+        self.gym.set_camera_location(self.policy_camera, self.envs[env_idx], cam_pos, cam_target)
+        self.gym.render_all_camera_sensors(self.sim)
+        img = self.gym.get_camera_image(
+            self.sim, self.envs[env_idx], self.policy_camera, gymapi.IMAGE_COLOR
+        )
+        arr = np.asarray(img, dtype=np.uint8)
+        h, w = int(height), int(width)
+        if arr.ndim == 1:
+            arr = arr.reshape(h, w, -1)
+        elif arr.ndim == 2:
+            arr = arr.reshape(h, w, -1)
+        if arr.shape[-1] >= 3:
+            return np.ascontiguousarray(arr[..., :3])
+        raise RuntimeError(f"Unexpected camera image shape: {arr.shape}")

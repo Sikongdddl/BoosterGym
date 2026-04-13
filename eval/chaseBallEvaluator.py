@@ -1,41 +1,50 @@
-from eval.evaluator import RLEvaluator, EpisodeSummary
-from typing import Dict, Any
+from typing import Dict, Sequence
+
+import matplotlib.patches as patches
 import numpy as np
-import torch
+
+from eval.evaluator import EpisodeRecord, RLEvaluator
+
 
 class ChaseBallEvaluator(RLEvaluator):
-    def __init__(self,
-        max_steps: int = 200, 
-        success_dist_thresh: float = 0.4, 
-        tb_prefix: str = "eval",
-        **kwargs):
-        super().__init__(max_steps=max_steps, tb_prefix=tb_prefix, **kwargs)
-        self.success_dist_thresh = float(success_dist_thresh)
+    @property
+    def task_name(self) -> str:
+        return "chaseBall"
 
-    def compute_step_metrics(self, env, infos) -> Dict[str, float]:
-        # —— 基于你当前任务的定义：XY 距离 + 朝向余弦 + 指数距离奖励
-        # 优先从 infos["rew_terms"] 读；缺失就自己从状态算
-        m = {}
-        terms = infos.get("rew_terms", {}) if isinstance(infos, dict) else {}
+    def extract_task_step_metrics(self, env, infos: Dict, rew_terms: Dict[str, float]) -> Dict[str, float]:
+        metrics = {
+            "dist_xy": rew_terms.get("dist_xy", float(np.linalg.norm(np.asarray(env.base_pos[0, :2].detach().cpu()) - np.asarray(env.target_xy.detach().cpu())))),
+        }
+        for key in ("heading_cos", "heading_term", "progress_gain", "speed_toward", "speed_orth", "spin_penalty"):
+            if key in rew_terms:
+                metrics[key] = rew_terms[key]
+        return metrics
 
-        # dist_xy
-        if "dist_xy" in terms:
-            dist_xy = float(terms["dist_xy"])
-        else:
-            rp = env.base_pos[0, :2].detach().cpu().numpy()
-            bp = env.body_states[0, env.controller.num_bodies_robot, 0:2].detach().cpu().numpy()
-            dist_xy = float(np.linalg.norm(bp - rp))
-        m["dist_xy"] = dist_xy
+    def summarize_task(self, episode: EpisodeRecord) -> Dict[str, float]:
+        dists = [step.task.get("dist_xy") for step in episode.steps if "dist_xy" in step.task]
+        heading = [step.task.get("heading_cos") for step in episode.steps if "heading_cos" in step.task]
+        return {
+            "min_dist_xy": float(np.min(dists)) if dists else np.nan,
+            "avg_dist_xy": float(np.mean(dists)) if dists else np.nan,
+            "avg_heading_cos": float(np.mean(heading)) if heading else np.nan,
+        }
 
-        # heading_cos（可选）
-        if "heading_cos" in terms:
-            m["heading_cos"] = float(terms["heading_cos"])
+    def get_time_series_keys(self) -> Sequence[str]:
+        return ("dist_xy", "heading_cos", "progress_gain", "speed_toward")
 
-        # reward（示例：exp(-dist_xy) + 0.3*heading - 0.01）
-        heading_term = 0.5*(m["heading_cos"]+1.0) if "heading_cos" in m else 0.0
-        m["reward"] = float(np.exp(-dist_xy) + 0.3*heading_term - 0.01)
-        return m
+    def draw_task_overlay(self, ax, episode: EpisodeRecord):
+        if episode.steps[-1].target_xy is None:
+            return
+        target_xy = episode.steps[-1].target_xy
+        ax.add_patch(
+            patches.Circle(
+                target_xy,
+                radius=0.6,
+                fill=False,
+                linestyle="--",
+                linewidth=1.5,
+                edgecolor="#2563eb",
+                alpha=0.8,
+            )
+        )
 
-    def is_success(self, acc: Dict[str, Any]) -> bool:
-        d = acc.get("final_dist_xy", None)
-        return (d is not None) and (d <= self.success_dist_thresh)
