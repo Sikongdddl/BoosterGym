@@ -11,7 +11,8 @@ This directory contains the high-level multi-agent RL stack for HyperGym.
 - RL algorithm: hybrid PPO
 - Self-play: FSP-style opponent pool
   - train the current best-response policy
-  - sample opponents from a mixture of scripted baseline and frozen historical snapshots
+  - keep training against scripted opponents until recent win rate reaches `0.8`
+  - only then unlock frozen historical snapshots
 
 ## Entrypoint
 

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.hlp.env import HyperGymSelfPlayConfig, HyperGymTeamEnv
+from scripts.hlp.env import HyperGymPolicyOpponent, HyperGymSelfPlayConfig, HyperGymTeamEnv
 from scripts.hlp.fsp import FSPOpponentPool
 from scripts.hlp.policy import TeamHybridActorCritic
 from scripts.hlp.reward import TeamRewardConfig, TeamRewardShaper
@@ -80,6 +80,8 @@ def main() -> None:
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--snapshot-interval", type=int, default=20)
     parser.add_argument("--scripted-prob", type=float, default=0.2)
+    parser.add_argument("--fsp-win-rate-threshold", type=float, default=0.8)
+    parser.add_argument("--fsp-win-rate-window", type=int, default=10)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -110,6 +112,14 @@ def main() -> None:
     )
     opponent_pool.add_snapshot(policy, label="init")
 
+    frozen_bc_policy = TeamHybridActorCritic(
+        obs_dim=obs_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+    ).to(device)
+    frozen_bc_policy.load_state_dict(policy.state_dict())
+    frozen_bc_policy.eval()
+
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     history: List[Dict] = []
@@ -117,17 +127,31 @@ def main() -> None:
     total_env_steps = 0
     best_goal_diff = -10**9
     episode_cursor = 0
+    fsp_unlocked = False
     for update_idx in range(args.updates):
         batch = RolloutBatch([], [], [], [], [], [], [], [])
         update_episode_returns: List[float] = []
         update_episode_steps: List[int] = []
         update_goal_for = 0
         update_goal_against = 0
+        update_wins = 0
+        update_losses = 0
+        update_draws = 0
 
         while len(batch.obs) < args.rollout_steps:
             controlled_team = "home" if episode_cursor % 2 == 0 else "away"
             opponent_team = "away" if controlled_team == "home" else "home"
-            opponent = opponent_pool.sample_opponent(team=opponent_team)
+            if fsp_unlocked:
+                opponent = opponent_pool.sample_opponent(team=opponent_team, allow_history=True)
+                opponent_source = "fsp_pool"
+            else:
+                opponent = HyperGymPolicyOpponent(
+                    policy=frozen_bc_policy,
+                    team=opponent_team,
+                    device=device,
+                    deterministic=True,
+                )
+                opponent_source = "frozen_bc"
             obs = env.reset(
                 controlled_team=controlled_team,
                 opponent_policy=opponent,
@@ -172,6 +196,12 @@ def main() -> None:
             update_episode_steps.append(episode_steps)
             update_goal_for += episode_goal_for
             update_goal_against += episode_goal_against
+            if episode_goal_for > episode_goal_against:
+                update_wins += 1
+            elif episode_goal_for < episode_goal_against:
+                update_losses += 1
+            else:
+                update_draws += 1
             episode_cursor += 1
 
         with torch.no_grad():
@@ -234,6 +264,17 @@ def main() -> None:
         for key in update_stats:
             update_stats[key] /= max(update_count, 1)
 
+        recent_rows = history[-max(int(args.fsp_win_rate_window) - 1, 0):] + [{
+            "wins": update_wins,
+            "losses": update_losses,
+            "draws": update_draws,
+        }]
+        recent_total_episodes = sum(row.get("wins", 0) + row.get("losses", 0) + row.get("draws", 0) for row in recent_rows)
+        recent_total_wins = sum(row.get("wins", 0) for row in recent_rows)
+        recent_win_rate = float(recent_total_wins / max(recent_total_episodes, 1))
+        if not fsp_unlocked and recent_win_rate >= float(args.fsp_win_rate_threshold):
+            fsp_unlocked = True
+
         row = {
             "update": update_idx + 1,
             "episodes_in_batch": len(update_episode_returns),
@@ -241,6 +282,12 @@ def main() -> None:
             "avg_episode_steps": float(np.mean(update_episode_steps)) if update_episode_steps else 0.0,
             "goal_for": update_goal_for,
             "goal_against": update_goal_against,
+            "wins": update_wins,
+            "losses": update_losses,
+            "draws": update_draws,
+            "recent_win_rate": recent_win_rate,
+            "fsp_unlocked": fsp_unlocked,
+            "opponent_source": opponent_source,
             "policy_loss": update_stats["policy_loss"],
             "value_loss": update_stats["value_loss"],
             "entropy": update_stats["entropy"],
@@ -252,11 +299,14 @@ def main() -> None:
             f"[hlp] update={row['update']} episodes={row['episodes_in_batch']} "
             f"avg_return={row['avg_episode_return']:.3f} avg_steps={row['avg_episode_steps']:.1f} "
             f"gf={update_goal_for} ga={update_goal_against} "
+            f"w={update_wins} l={update_losses} d={update_draws} "
+            f"wr={recent_win_rate:.3f} fsp={'on' if fsp_unlocked else 'off'} "
+            f"opp={opponent_source} "
             f"pi={row['policy_loss']:.4f} vf={row['value_loss']:.4f} ent={row['entropy']:.4f} "
             f"pool={row['pool_size']}"
         )
 
-        if (update_idx + 1) % args.snapshot_interval == 0:
+        if fsp_unlocked and (update_idx + 1) % args.snapshot_interval == 0:
             opponent_pool.add_snapshot(policy, label=f"update_{update_idx + 1}")
 
         save_checkpoint(save_dir / "last.pt", policy, optimizer, history, vars(args))

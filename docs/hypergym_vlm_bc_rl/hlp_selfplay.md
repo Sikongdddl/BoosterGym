@@ -74,6 +74,11 @@ Opponents are sampled from a mixture of:
 
 This avoids training only against the latest self clone and gives a more stable opponent distribution.
 
+Current gating rule:
+
+- if recent win rate is below `0.8`, do not unlock FSP history sampling
+- if recent win rate is below `0.8`, do not add new historical snapshots to the pool
+
 Reference:
 
 - [fsp.py](/home/ubuntu/jrWork/booster_gym/scripts/hlp/fsp.py)

@@ -19,6 +19,7 @@ The main implemented directions are:
 - VLM-based tactical data collection in `hyperGym`
 - behavior cloning from VLM trajectories
 - high-level self-play RL initialized from BC
+- explicit checkpoint organization under `core/checkpoints/`
 
 ## Three-Layer Architecture
 
@@ -51,6 +52,7 @@ Relevant directories:
 - [envs/trapBall](/home/ubuntu/jrWork/booster_gym/envs/trapBall)
 - [scripts/train.py](/home/ubuntu/jrWork/booster_gym/scripts/train.py)
 - [scripts/runner.py](/home/ubuntu/jrWork/booster_gym/scripts/runner.py)
+- [core/checkpoints/mid_level](/home/ubuntu/jrWork/booster_gym/core/checkpoints/mid_level)
 
 ### 3. High-Level Tactics
 
@@ -74,6 +76,27 @@ Current high-level action format:
 
 For 2v2 training, the policy takes the full 4-player state and outputs actions for one acting team.
 
+Current observation format:
+
+- one team-conditioned `29`-dim state vector
+- includes all 4 players and the ball
+- per-player features:
+  - `x, y`
+  - `vx, vy`
+  - `is_controlled_team`
+  - `has_ball`
+- ball features:
+  - `ball_x, ball_y`
+  - `ball_vx, ball_vy`
+  - `owner_flag`
+
+Action semantics:
+
+- each acting team outputs two per-player actions
+- each action is `(policy_id, target_xy)`
+- `policy_id in {move, pass, trap}`
+- `trap` still carries a `target_xy` for interface consistency, but its meaning is interception / receive location rather than kick destination
+
 Relevant directories:
 
 - [envs/hyperGym](/home/ubuntu/jrWork/booster_gym/envs/hyperGym)
@@ -87,7 +110,9 @@ The current high-level workflow is:
 1. Use VLMs to act in `hyperGym` and collect tactical trajectories.
 2. Filter usable VLM decisions and train a state-only BC policy.
 3. Use the BC policy as initialization for high-level self-play RL.
-4. Improve tactical behavior, especially passing and scoring, through dense reward shaping and FSP-style opponent sampling.
+4. Start RL against a frozen BC opponent.
+5. Only unlock FSP-style opponent history when recent win rate reaches `0.8`.
+6. Improve tactical behavior, especially passing and scoring, through dense reward shaping and staged self-play.
 
 This part of the repository is documented here:
 
@@ -103,6 +128,7 @@ Key directories:
 - [envs](/home/ubuntu/jrWork/booster_gym/envs): task environments, including Isaac Gym tasks and `hyperGym`
 - [core/agents](/home/ubuntu/jrWork/booster_gym/core/agents): reusable RL agents
 - [core/imitation](/home/ubuntu/jrWork/booster_gym/core/imitation): BC datasets and models
+- [core/checkpoints](/home/ubuntu/jrWork/booster_gym/core/checkpoints): reusable low-level, mid-level, and high-level checkpoints
 - [scripts](/home/ubuntu/jrWork/booster_gym/scripts): stable top-level training and inference entrypoints
 - [scripts/tmp](/home/ubuntu/jrWork/booster_gym/scripts/tmp): temporary or experiment-specific scripts
 - [scripts/hlp](/home/ubuntu/jrWork/booster_gym/scripts/hlp): high-level self-play RL stack
@@ -157,6 +183,7 @@ The current [requirements.txt](/home/ubuntu/jrWork/booster_gym/requirements.txt)
 ## Notes
 
 - `datasets/` is ignored by git and is expected to contain large generated artifacts.
+- `core/checkpoints/` is ignored by git and stores canonical reusable weights for the current workflow.
 - `logs/` contains checkpoints and experiment outputs.
 - Many files under [scripts/tmp](/home/ubuntu/jrWork/booster_gym/scripts/tmp) are exploratory and may change quickly.
 

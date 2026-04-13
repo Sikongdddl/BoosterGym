@@ -17,6 +17,7 @@ BoosterGym 是一个面向机器人足球控制的研究型代码仓库，核心
 - 基于 VLM 的 `hyperGym` 轨迹采集
 - 基于 VLM 数据的行为克隆
 - 从 BC 初始化出发的 high-level 对抗强化学习
+- `core/checkpoints/` 统一管理当前工作流需要复用的权重
 
 这个仓库仍然是研究工作区，不是整理完毕的开源 release。
 
@@ -49,6 +50,7 @@ BoosterGym 是一个面向机器人足球控制的研究型代码仓库，核心
 - [envs/trapBall](/home/ubuntu/jrWork/booster_gym/envs/trapBall)
 - [scripts/train.py](/home/ubuntu/jrWork/booster_gym/scripts/train.py)
 - [scripts/runner.py](/home/ubuntu/jrWork/booster_gym/scripts/runner.py)
+- [core/checkpoints/mid_level](/home/ubuntu/jrWork/booster_gym/core/checkpoints/mid_level)
 
 ### 3. High-Level
 
@@ -71,6 +73,24 @@ BoosterGym 是一个面向机器人足球控制的研究型代码仓库，核心
 
 在 2v2 设定下，策略输入四个球员和球的全局状态，但只输出一个队伍两个人的动作。
 
+当前高层观测是一个 team-conditioned 的 `29` 维状态向量，包含：
+
+- 4 个球员的状态
+  - `x, y`
+  - `vx, vy`
+  - `is_controlled_team`
+  - `has_ball`
+- 球的状态
+  - `ball_x, ball_y`
+  - `ball_vx, ball_vy`
+  - `owner_flag`
+
+当前高层动作可以理解成：
+
+- 每个队伍输出两个 `(policy_id, target_xy)`
+- `policy_id ∈ {move, pass, trap}`
+- `trap` 也保留 `target_xy`，但它的语义是“截球/接球位置”，不是传球目标
+
 相关位置：
 
 - [envs/hyperGym](/home/ubuntu/jrWork/booster_gym/envs/hyperGym)
@@ -84,7 +104,9 @@ BoosterGym 是一个面向机器人足球控制的研究型代码仓库，核心
 1. 在 `hyperGym` 中调用 VLM 进行战术决策并采集轨迹。
 2. 过滤出可用的 VLM 样本，训练 state-only 的 BC policy。
 3. 用 BC policy 初始化 high-level RL。
-4. 用 dense reward shaping 和 FSP 风格自博弈继续优化传球和进球能力。
+4. 先以冻结的 BC policy 作为初始对手。
+5. 只有最近 win rate 达到 `0.8` 后，才解锁 FSP 风格的历史对手池。
+6. 用 dense reward shaping 和 staged self-play 继续优化传球和进球能力。
 
 对应文档：
 
@@ -100,6 +122,7 @@ BoosterGym 是一个面向机器人足球控制的研究型代码仓库，核心
 - [envs](/home/ubuntu/jrWork/booster_gym/envs)：环境定义，包括 Isaac Gym 任务和 `hyperGym`
 - [core/agents](/home/ubuntu/jrWork/booster_gym/core/agents)：可复用 RL agent
 - [core/imitation](/home/ubuntu/jrWork/booster_gym/core/imitation)：行为克隆相关数据与模型
+- [core/checkpoints](/home/ubuntu/jrWork/booster_gym/core/checkpoints)：当前工作流复用的 low/mid/high level 权重
 - [scripts](/home/ubuntu/jrWork/booster_gym/scripts)：保留的稳定入口
 - [scripts/tmp](/home/ubuntu/jrWork/booster_gym/scripts/tmp)：实验性脚本和临时工作流
 - [scripts/hlp](/home/ubuntu/jrWork/booster_gym/scripts/hlp)：high-level self-play RL
@@ -154,6 +177,7 @@ python scripts/hlp/train_selfplay.py \
 ## 说明
 
 - `datasets/` 已加入 `.gitignore`，默认用于存放大体量采样数据
+- `core/checkpoints/` 已加入 `.gitignore`，用于存放当前工作流需要复用的权重资产
 - `logs/` 存放 checkpoint 和实验输出
 - [scripts/tmp](/home/ubuntu/jrWork/booster_gym/scripts/tmp) 下很多脚本是快速实验产物，变化会比较快
 

@@ -41,8 +41,8 @@ class FSPOpponentPool:
         frozen = {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
         self.snapshots.append(PolicySnapshot(label=label, state_dict=frozen))
 
-    def sample_opponent(self, team: str, deterministic: bool = True):
-        if not self.snapshots or self.rng.random() < self.scripted_prob:
+    def sample_opponent(self, team: str, deterministic: bool = True, allow_history: bool = True):
+        if (not allow_history) or (not self.snapshots) or self.rng.random() < self.scripted_prob:
             return SimpleMatchPolicy(team=team, seed=int(self.rng.integers(0, 1_000_000)))
 
         snapshot = self.snapshots[int(self.rng.integers(0, len(self.snapshots)))]
