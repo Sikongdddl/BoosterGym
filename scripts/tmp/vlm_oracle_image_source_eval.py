@@ -11,26 +11,26 @@ from typing import Any, Dict
 import numpy as np
 import isaacgym
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.vlm_oracle_correctness_eval import evaluate_samples
-from scripts.vlm_oracle_correctness_eval import generate_oracle_dataset
-from scripts.vlm_oracle_correctness_eval import _parse_case_ids
-from scripts.vlm_oracle_correctness_eval import _parse_episode_seeds
-from scripts.vlm_policy_poc import DEFAULT_VLM_BASE_URL
-from scripts.vlm_policy_poc import DEFAULT_VLM_MODEL
-from scripts.vlm_policy_poc import OBSERVATION_MODES
-from scripts.vlm_policy_poc import OpenAICompatibleVisionVLM
-from scripts.vlm_policy_poc import _get_vlm_api_key
-from scripts.vlm_policy_poc import _make_render_record
-from scripts.vlm_policy_poc import _parse_team_decision
-from scripts.vlm_policy_poc import _save_artifact
-from scripts.vlm_policy_poc import _state_text_summary
-from scripts.vlm_policy_poc import _team_decision_to_action
-from scripts.vlm_policy_poc import _to_plain
-from scripts.vlm_policy_poc import render_record_with_camera
+from scripts.tmp.vlm_oracle_correctness_eval import evaluate_samples
+from scripts.tmp.vlm_oracle_correctness_eval import generate_oracle_dataset
+from scripts.tmp.vlm_oracle_correctness_eval import _parse_case_ids
+from scripts.tmp.vlm_oracle_correctness_eval import _parse_episode_seeds
+from scripts.tmp.vlm_policy_poc import DEFAULT_VLM_BASE_URL
+from scripts.tmp.vlm_policy_poc import DEFAULT_VLM_MODEL
+from scripts.tmp.vlm_policy_poc import OBSERVATION_MODES
+from scripts.tmp.vlm_policy_poc import OpenAICompatibleVisionVLM
+from scripts.tmp.vlm_policy_poc import _get_vlm_api_key
+from scripts.tmp.vlm_policy_poc import _make_render_record
+from scripts.tmp.vlm_policy_poc import _parse_team_decision
+from scripts.tmp.vlm_policy_poc import _save_artifact
+from scripts.tmp.vlm_policy_poc import _state_text_summary
+from scripts.tmp.vlm_policy_poc import _team_decision_to_action
+from scripts.tmp.vlm_policy_poc import _to_plain
+from scripts.tmp.vlm_policy_poc import render_record_with_camera
 
 
 IMAGE_SOURCES = {
@@ -186,7 +186,7 @@ def evaluate_samples_with_image_source(
     episode_seeds = {}
     evaluated_samples = []
 
-    from scripts.vlm_oracle_correctness_eval import _euclidean, _oracle_policy_id
+    from scripts.tmp.vlm_oracle_correctness_eval import _euclidean, _oracle_policy_id
 
     for sample in samples:
         episode_idx = int(sample["episode"])

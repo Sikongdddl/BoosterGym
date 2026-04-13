@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import sys
@@ -13,8 +14,9 @@ from urllib import error as url_error
 from urllib import request as url_request
 
 import numpy as np
+from PIL import Image
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -36,6 +38,8 @@ OBSERVATION_MODES = {
 DEFAULT_VISION_VIEW = "global"
 DEFAULT_VLM_MODEL = "qwen3vl"
 DEFAULT_VLM_BASE_URL = "https://models.sjtu.edu.cn/api/v1"
+DEFAULT_VLM_IMAGE_MAX_WIDTH = 320
+DEFAULT_VLM_IMAGE_JPEG_QUALITY = 80
 
 
 @dataclass
@@ -183,11 +187,21 @@ def _make_render_record(
 class OpenAICompatibleVisionVLM:
     """OpenAI-compatible vision client with a constrained tactic prompt."""
 
-    def __init__(self, model: str, api_key: str, base_url: str, timeout_seconds: float = 30.0):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str,
+        timeout_seconds: float = 30.0,
+        image_max_width: int = DEFAULT_VLM_IMAGE_MAX_WIDTH,
+        image_jpeg_quality: int = DEFAULT_VLM_IMAGE_JPEG_QUALITY,
+    ):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
+        self.image_max_width = int(image_max_width)
+        self.image_jpeg_quality = int(image_jpeg_quality)
 
     def decide(self, state: Dict[str, Any], state_text: str, image_path: Path, vision_view: str) -> Dict[str, Any]:
         field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
@@ -197,8 +211,11 @@ class OpenAICompatibleVisionVLM:
             for player in home_players
         )
         home_player_ids = ", ".join(player["player_id"] for player in home_players)
-        with open(image_path, "rb") as file_obj:
-            image_b64 = base64.b64encode(file_obj.read()).decode("utf-8")
+        image_data_url = _prepare_vlm_image_data_url(
+            image_path=image_path,
+            max_width=self.image_max_width,
+            jpeg_quality=self.image_jpeg_quality,
+        )
 
         schema_text = (
             "Return ONLY valid JSON with this shape: "
@@ -208,11 +225,15 @@ class OpenAICompatibleVisionVLM:
             "Policy semantics:\n"
             "- move_to_target: use when home should run to space, close down a loose ball, or reposition.\n"
             "- trap_ball: use when the ball is free or moving and home should first secure control near the ball.\n"
-            "- pass_to_target: use only when a home player can plausibly play the ball now and the target is a useful forward or lateral destination, not the current ball position.\n"
+            "- pass_to_target: this means kicking the ball to a target, not only passing to a teammate. Use it for passes, clearances, and direct shots on goal when the shooter can plausibly strike the ball now.\n"
             "Hard constraints:\n"
             "- If owner starts with 'home_', do not output trap_ball because home already controls the ball.\n"
             "- If owner is free, prefer move_to_target or trap_ball over pass_to_target.\n"
             "- If home already controls the ball, prefer move_to_target for ball progression because dribble is not available in this environment.\n"
+            "- If home has the ball near goal and the shooting lane is open, prefer pass_to_target aimed inside the goal mouth instead of a harmless extra pass.\n"
+            "- Treat pass_to_target as the only available kick action: if a direct shot is best, encode that shot with pass_to_target.\n"
+            "- Treat the touchlines as dangerous: when the ball is near the top or bottom boundary, avoid targets that keep pushing play along or into the sideline.\n"
+            "- Near a sideline, prefer recycling the ball back inward or switching to safer interior space over continuing a risky edge run.\n"
             "- Avoid meaningless pass_to_target to the current ball location or to a point behind the attack."
         )
         prompt_lines = [
@@ -246,7 +267,7 @@ class OpenAICompatibleVisionVLM:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
                     ],
                 }
             ],
@@ -300,6 +321,20 @@ class OpenAICompatibleVisionVLM:
             if start >= 0 and end > start:
                 return json.loads(cleaned[start:end + 1])
             raise RuntimeError(f"VLM output is not valid JSON: {text_output}")
+
+
+def _prepare_vlm_image_data_url(image_path: Path, max_width: int, jpeg_quality: int) -> str:
+    max_width = int(max_width)
+    jpeg_quality = int(np.clip(jpeg_quality, 20, 95))
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        if max_width > 0 and image.width > max_width:
+            new_height = max(1, int(round(image.height * (max_width / image.width))))
+            image = image.resize((max_width, new_height), Image.Resampling.BILINEAR)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+        image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{image_b64}"
 
 
 def _fallback_decision_for_player(player_id: str, state: Dict[str, Any], fallback_reason: str) -> VLMDecision:

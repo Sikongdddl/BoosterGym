@@ -5,7 +5,8 @@ runs
 runs/**
 videos/
 videos/**
+datasets/
+datasets/**
 
 # python cache
 __pycache__/
-

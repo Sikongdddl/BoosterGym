@@ -52,7 +52,7 @@
 命令示例：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode benchmark \
   --observation-mode image_with_state_text \
   --vlm-model qwen3vl \
@@ -64,7 +64,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
 只看图像的对照组：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode benchmark \
   --observation-mode image_only \
   --vlm-model qwen3vl \
@@ -96,7 +96,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
 命令示例：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode rollout \
   --episodes 3 \
   --max-steps 40 \
@@ -121,7 +121,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
 如果默认开局大量时间都花在抢自由球，可以直接从固定 benchmark 状态启动 rollout：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode rollout \
   --episodes 2 \
   --max-steps 20 \
@@ -136,7 +136,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
 只看图像的控球起手对照组：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode rollout \
   --episodes 2 \
   --max-steps 20 \
@@ -155,7 +155,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
 基线：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episodes 3 \
   --max-steps 30 \
   --samples-per-episode 6 \
@@ -172,7 +172,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
 对照组：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episodes 3 \
   --max-steps 30 \
   --samples-per-episode 6 \
@@ -199,7 +199,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
 命令示例：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -217,7 +217,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
 如果要看“只给 ego-centric 图像、不再给状态文本”的更激进设置：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -250,7 +250,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_oracle_correctness_eval.py \
 推荐先跑这两组对照：
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode benchmark \
   --observation-mode image_only \
   --vision-view global \
@@ -262,7 +262,7 @@ OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
 ```
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/vlm_policy_poc.py \
+OPENAI_API_KEY=... python3 scripts/tmp/vlm_policy_poc.py \
   --mode benchmark \
   --observation-mode image_only \
   --vision-view ego_fp_home_0 \

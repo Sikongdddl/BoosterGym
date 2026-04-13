@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import sys
@@ -14,14 +13,14 @@ from urllib import request as url_request
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.hyperGym.main import build_match_controller
 from envs.hyperGym.renderer import render_episode_mp4, render_record
-from scripts.vlm_policy_poc import _clip_target, _get_vlm_api_key, _make_render_record, _save_artifact, _to_plain
-from scripts.vlm_policy_poc import DEFAULT_VLM_BASE_URL, DEFAULT_VLM_MODEL
+from scripts.tmp.vlm_policy_poc import _clip_target, _get_vlm_api_key, _make_render_record, _prepare_vlm_image_data_url, _save_artifact, _to_plain
+from scripts.tmp.vlm_policy_poc import DEFAULT_VLM_BASE_URL, DEFAULT_VLM_MODEL
 
 
 ALLOWED_POLICY_IDS = {
@@ -45,10 +44,12 @@ class TeamVLMDecision:
 
 
 class OpenAICompatibleVisionVLM:
-    def __init__(self, model: str, api_key: str, base_url: str):
+    def __init__(self, model: str, api_key: str, base_url: str, image_max_width: int = 320, image_jpeg_quality: int = 80):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.image_max_width = int(image_max_width)
+        self.image_jpeg_quality = int(image_jpeg_quality)
 
     def decide(self, team: str, state: Dict[str, Any], state_text: str, image_path: Path) -> Dict[str, Any]:
         field = np.asarray(state.get("field_size", [10.0, 6.0]), dtype=np.float32)
@@ -58,8 +59,11 @@ class OpenAICompatibleVisionVLM:
             for player in team_players
         )
         team_player_ids = ", ".join(player["player_id"] for player in team_players)
-        with open(image_path, "rb") as file_obj:
-            image_b64 = base64.b64encode(file_obj.read()).decode("utf-8")
+        image_data_url = _prepare_vlm_image_data_url(
+            image_path=image_path,
+            max_width=self.image_max_width,
+            jpeg_quality=self.image_jpeg_quality,
+        )
 
         attack_direction = "right" if team == "home" else "left"
         own_prefix = f"{team}_"
@@ -68,11 +72,15 @@ class OpenAICompatibleVisionVLM:
             "Policy semantics:\n"
             "- move_to_target: use when this team should run to space, close down a loose ball, or reposition.\n"
             "- trap_ball: use when the ball is free or moving and this team should first secure control near the ball.\n"
-            "- pass_to_target: use only when one player can plausibly play the ball now and the target is a useful forward or lateral destination, not the current ball position.\n"
+            "- pass_to_target: this means kicking the ball to a target, not only passing to a teammate. Use it for passes, clearances, and direct shots on goal when a player can plausibly strike the ball now.\n"
             "Hard constraints:\n"
             f"- If owner starts with '{own_prefix}', do not output trap_ball because this team already controls the ball.\n"
             "- If owner is free, prefer move_to_target or trap_ball over pass_to_target.\n"
             "- If this team already controls the ball, prefer move_to_target for ball progression because dribble is not available in this environment.\n"
+            "- If this team has the ball near goal and the shooting lane is open, prefer pass_to_target aimed inside the goal mouth instead of a harmless extra pass.\n"
+            "- Treat pass_to_target as the only available kick action: if a direct shot is best, encode that shot with pass_to_target.\n"
+            "- Treat the touchlines as dangerous: when the ball is near the top or bottom boundary, avoid targets that keep pushing play along or into the sideline.\n"
+            "- Near a sideline, prefer recycling the ball back inward or switching to safer interior space over continuing a risky edge run.\n"
             f"- Favor targets that progress the attack toward the {attack_direction} side.\n"
             "- Avoid meaningless pass_to_target to the current ball location or to a point behind the attack."
         )
@@ -94,7 +102,7 @@ class OpenAICompatibleVisionVLM:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
                     ],
                 }
             ],
@@ -321,6 +329,80 @@ def _team_decision_to_action(team_decision: TeamVLMDecision) -> Dict[str, Any]:
     return {player_id: _decision_to_action(decision) for player_id, decision in team_decision.players.items()}
 
 
+def _lookup_player(state: Dict[str, Any], player_id: str) -> Optional[Dict[str, Any]]:
+    for player in state.get("players", []):
+        if player.get("player_id") == player_id:
+            return player
+    return None
+
+
+def _player_decision_complete(state: Dict[str, Any], player_id: str, decision: VLMDecision) -> bool:
+    player = _lookup_player(state, player_id)
+    if player is None:
+        return True
+    player_pos = np.asarray(player["position"], dtype=np.float32)
+    target = np.asarray(decision.target, dtype=np.float32)
+    ball = np.asarray(state["ball_position"], dtype=np.float32)
+    ball_speed = float(np.linalg.norm(np.asarray(state.get("ball_velocity", [0.0, 0.0]), dtype=np.float32)))
+    owner_id = state.get("ball_owner_id")
+
+    if decision.policy_id == "move_to_target":
+        return float(np.linalg.norm(player_pos - target)) <= 0.32
+    if decision.policy_id == "trap_ball":
+        near_ball = float(np.linalg.norm(player_pos - ball)) <= 0.38
+        return near_ball and (ball_speed <= 0.05 or owner_id == player_id)
+    if decision.policy_id == "pass_to_target":
+        return owner_id != player_id
+    return False
+
+
+def _should_query_team(
+    *,
+    team: str,
+    state: Dict[str, Any],
+    recent_events: List[Dict[str, Any]],
+    cached_decision: Optional[TeamVLMDecision],
+    cached_action: Optional[Dict[str, Any]],
+    last_query_step: Optional[int],
+    step_idx: int,
+    max_query_interval: int,
+    previous_owner_id: Optional[str],
+) -> bool:
+    if cached_decision is None or cached_action is None or last_query_step is None:
+        return True
+    if step_idx - last_query_step >= max(1, int(max_query_interval)):
+        return True
+
+    owner_id = state.get("ball_owner_id")
+    if owner_id != previous_owner_id:
+        return True
+
+    important_events = {
+        "goal_scored",
+        "ball_out_of_bounds",
+        "loose_ball",
+        "dead_ball",
+        "loose_ball_scramble",
+        "turnover",
+        "ball_control_gained",
+        "ball_control_lost",
+        "trap_completed",
+        "pass_started",
+        "move_touch",
+        "steal_attempt_won",
+    }
+    for event in recent_events:
+        event_type = event.get("event_type")
+        event_team = event.get("team")
+        if event_type in important_events and (event_team is None or event_team == team):
+            return True
+
+    for player_id, decision in cached_decision.players.items():
+        if _player_decision_complete(state, player_id, decision):
+            return True
+    return False
+
+
 def _build_vlm(model: str, base_url: str) -> OpenAICompatibleVisionVLM:
     return OpenAICompatibleVisionVLM(model=model, api_key=_get_vlm_api_key(), base_url=base_url)
 
@@ -412,6 +494,7 @@ def run_matches(
             num_away=num_away,
             seed=seed + episode_idx,
             max_steps=max_steps,
+            end_on_ball_out=True,
         )
         simulation = controller.simulation
         state = simulation.reset()
@@ -437,24 +520,46 @@ def run_matches(
         step_idx = 0
         cached_home_action: Optional[Dict[str, Any]] = None
         cached_away_action: Optional[Dict[str, Any]] = None
+        cached_home_decision: Optional[TeamVLMDecision] = None
+        cached_away_decision: Optional[TeamVLMDecision] = None
+        home_last_query_step: Optional[int] = None
+        away_last_query_step: Optional[int] = None
+        previous_owner_id: Optional[str] = None
 
         while not done and step_idx < max_steps:
             state = simulation.get_state()
-            should_query = (
-                cached_home_action is None
-                or cached_away_action is None
-                or step_idx % max(1, int(query_interval)) == 0
+            record = _make_render_record(
+                state=state,
+                reward=reward,
+                done=done,
+                action=home_action,
+                away_action=away_action,
+                events=recent_events,
             )
-            if should_query:
-                record = _make_render_record(
-                    state=state,
-                    reward=reward,
-                    done=done,
-                    action=home_action,
-                    away_action=away_action,
-                    events=recent_events,
-                )
-                step_artifact_dir = save_dir / f"artifacts_ep_{episode_idx:03d}"
+            step_artifact_dir = save_dir / f"artifacts_ep_{episode_idx:03d}"
+            should_query_home = _should_query_team(
+                team="home",
+                state=state,
+                recent_events=recent_events,
+                cached_decision=cached_home_decision,
+                cached_action=cached_home_action,
+                last_query_step=home_last_query_step,
+                step_idx=step_idx,
+                max_query_interval=query_interval,
+                previous_owner_id=previous_owner_id,
+            )
+            should_query_away = _should_query_team(
+                team="away",
+                state=state,
+                recent_events=recent_events,
+                cached_decision=cached_away_decision,
+                cached_action=cached_away_action,
+                last_query_step=away_last_query_step,
+                step_idx=step_idx,
+                max_query_interval=query_interval,
+                previous_owner_id=previous_owner_id,
+            )
+            if should_query_home:
                 home_query = _query_team_vlm(
                     vlm=vlm,
                     team="home",
@@ -463,6 +568,12 @@ def run_matches(
                     state_text=_state_text_summary(state, recent_events, team="home"),
                     artifact_dir=step_artifact_dir,
                 )
+                cached_home_action = home_query["action"]
+                cached_home_decision = home_query["decision"]
+                home_last_query_step = step_idx
+                if any(decision.source != "vlm" for decision in home_query["decision"].players.values()):
+                    home_fallback_steps += 1
+            if should_query_away:
                 away_query = _query_team_vlm(
                     vlm=vlm,
                     team="away",
@@ -471,11 +582,9 @@ def run_matches(
                     state_text=_state_text_summary(state, recent_events, team="away"),
                     artifact_dir=step_artifact_dir,
                 )
-
-                cached_home_action = home_query["action"]
                 cached_away_action = away_query["action"]
-                if any(decision.source != "vlm" for decision in home_query["decision"].players.values()):
-                    home_fallback_steps += 1
+                cached_away_decision = away_query["decision"]
+                away_last_query_step = step_idx
                 if any(decision.source != "vlm" for decision in away_query["decision"].players.values()):
                     away_fallback_steps += 1
 
@@ -492,6 +601,7 @@ def run_matches(
                 "info": info,
             })
             recent_events = info.get("events", [])
+            previous_owner_id = state.get("ball_owner_id")
             step_idx += 1
 
         winner = records[-1]["info"]["state"].get("winner")
@@ -538,7 +648,7 @@ def main() -> None:
     parser.add_argument("--num-home", type=int, default=1)
     parser.add_argument("--num-away", type=int, default=1)
     parser.add_argument("--fps", type=int, default=10)
-    parser.add_argument("--query-interval", type=int, default=1)
+    parser.add_argument("--query-interval", type=int, default=5, help="最大查询间隔；动作完成、球权变化或关键事件会提前触发重问。")
     parser.add_argument("--vlm-model", type=str, default=DEFAULT_VLM_MODEL)
     parser.add_argument("--vlm-base-url", type=str, default=os.getenv("OPENAI_BASE_URL", DEFAULT_VLM_BASE_URL))
     parser.add_argument("--save-dir", type=str, required=True)

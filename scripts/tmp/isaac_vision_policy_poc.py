@@ -6,7 +6,7 @@ Proves the pipeline for feeding simulation images into a high-level policy. Repl
 with a VLM or CNN when ready.
 
 Usage (from repo root, with IsaacGym available):
-  python scripts/isaac_vision_policy_poc.py --task passBall --task-class PassBallEnv --episodes 3
+  python scripts/tmp/isaac_vision_policy_poc.py --task passBall --task-class PassBallEnv --episodes 3
 
 Requires in YAML (or overridden below):
   basic.headless: true
@@ -23,13 +23,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import isaacgym
 from envs.hyperGym.isaac_wrapper import isaac_booster_multi_tensors_to_hyper_state
-from scripts.vlm_policy_poc import (
+from scripts.tmp.vlm_policy_poc import (
     DEFAULT_VLM_BASE_URL,
     DEFAULT_VLM_MODEL,
     OpenAICompatibleVisionVLM,

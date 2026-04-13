@@ -165,7 +165,7 @@
 运行：
 
 ```bash
-python3 scripts/render_hypergym_episode.py
+python3 scripts/tmp/render_hypergym_episode.py
 ```
 
 当前会导出：

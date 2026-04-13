@@ -8,23 +8,23 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.hyperGym.main import build_match_controller
 from envs.hyperGym.renderer import render_episode_mp4
-from scripts.vlm_policy_poc import DEFAULT_VISION_VIEW
-from scripts.vlm_policy_poc import DEFAULT_VLM_BASE_URL
-from scripts.vlm_policy_poc import DEFAULT_VLM_MODEL
-from scripts.vlm_policy_poc import OBSERVATION_MODES
-from scripts.vlm_policy_poc import _build_vlm
-from scripts.vlm_policy_poc import _get_benchmark_case
-from scripts.vlm_policy_poc import _make_render_record
-from scripts.vlm_policy_poc import _query_vlm_on_record
-from scripts.vlm_policy_poc import _set_manual_state
-from scripts.vlm_policy_poc import _state_text_summary
-from scripts.vlm_policy_poc import _to_plain
+from scripts.tmp.vlm_policy_poc import DEFAULT_VISION_VIEW
+from scripts.tmp.vlm_policy_poc import DEFAULT_VLM_BASE_URL
+from scripts.tmp.vlm_policy_poc import DEFAULT_VLM_MODEL
+from scripts.tmp.vlm_policy_poc import OBSERVATION_MODES
+from scripts.tmp.vlm_policy_poc import _build_vlm
+from scripts.tmp.vlm_policy_poc import _get_benchmark_case
+from scripts.tmp.vlm_policy_poc import _make_render_record
+from scripts.tmp.vlm_policy_poc import _query_vlm_on_record
+from scripts.tmp.vlm_policy_poc import _set_manual_state
+from scripts.tmp.vlm_policy_poc import _state_text_summary
+from scripts.tmp.vlm_policy_poc import _to_plain
 
 
 def _parse_case_ids(text: str) -> List[str]:

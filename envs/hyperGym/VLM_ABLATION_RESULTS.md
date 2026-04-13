@@ -52,7 +52,7 @@ oracle correctness 采样帧，可视为一般情况。
 
 - 记录时间：2026-03-17 17:20:10 CST
 - 环境：`hyperGym`
-- 评测脚本：`scripts/vlm_oracle_correctness_eval.py`
+- 评测脚本：`scripts/tmp/vlm_oracle_correctness_eval.py`
 - 模型：`qwen3vl`
 - 接口：`https://models.sjtu.edu.cn/api/v1`
 
@@ -86,7 +86,7 @@ oracle correctness 采样帧，可视为一般情况。
 ### Commands
 
 ```bash
-OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=*** python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -101,7 +101,7 @@ OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
 ```
 
 ```bash
-OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=*** python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -241,7 +241,7 @@ OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
 ### Commands
 
 ```bash
-OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=*** python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -257,7 +257,7 @@ OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
 ```
 
 ```bash
-OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=*** python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -359,7 +359,7 @@ OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
 ### Commands
 
 ```bash
-OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=*** python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \
@@ -375,7 +375,7 @@ OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
 ```
 
 ```bash
-OPENAI_API_KEY=*** python3 scripts/vlm_oracle_correctness_eval.py \
+OPENAI_API_KEY=*** python3 scripts/tmp/vlm_oracle_correctness_eval.py \
   --episode-seeds 7,8,9 \
   --episodes 3 \
   --max-steps 30 \

@@ -374,15 +374,16 @@ class HyperGymSimulation:
                 return
 
             if self.params.end_on_ball_out:
-                # IMPORTANT: with dead-ball enabled, touching the touchline/goal-line ends play immediately.
-                # Do not let wall bounce happen first, otherwise the simulator hides real out-of-bounds risk.
+                # IMPORTANT: with dead-ball enabled, the ball should move freely and only be terminated by
+                # the out-of-bounds rule itself. Do not let wall bounce happen first.
                 out_info = self._check_ball_out(self.ball.position)
                 if out_info is not None:
                     self.winner = "ball_out"
                     step_events.append(out_info)
                     return
 
-            self._resolve_wall_collision(step_events)
+            if not self.params.end_on_ball_out:
+                self._resolve_wall_collision(step_events)
             self._resolve_ball_player_collisions(step_events)
             self.ball.velocity = self.ball.velocity * decay
 
@@ -458,13 +459,13 @@ class HyperGymSimulation:
         goal_min_y = height * 0.5 - self.params.goal_half_width
         goal_max_y = height * 0.5 + self.params.goal_half_width
         in_goal_mouth = goal_min_y <= y <= goal_max_y
-        if x <= r and not in_goal_mouth:
+        if x < -r and not in_goal_mouth:
             return {"event_type": "ball_out_of_bounds", "side": "left", "position": np.asarray(position, dtype=np.float32).copy()}
-        if x >= width - r and not in_goal_mouth:
+        if x > width + r and not in_goal_mouth:
             return {"event_type": "ball_out_of_bounds", "side": "right", "position": np.asarray(position, dtype=np.float32).copy()}
-        if y <= r:
+        if y < -r:
             return {"event_type": "ball_out_of_bounds", "side": "bottom", "position": np.asarray(position, dtype=np.float32).copy()}
-        if y >= height - r:
+        if y > height + r:
             return {"event_type": "ball_out_of_bounds", "side": "top", "position": np.asarray(position, dtype=np.float32).copy()}
         return None
 
@@ -691,23 +692,24 @@ class HyperGymSimulation:
         # IMPORTANT: this helper is only for overlap resolution.
         # It must never be turned into a generic "place ball in front of player" utility.
         min_dist = self.ball.radius + self.params.player_collision_radius + 0.01
-        direction = np.asarray(preferred_dir, dtype=np.float32)
-        norm = float(np.linalg.norm(direction))
-        if norm < 1e-8:
-            delta = self.ball.position - actor.position
-            delta_norm = float(np.linalg.norm(delta))
-            if delta_norm > 1e-8:
-                direction = delta / delta_norm
-            else:
-                direction = np.asarray([1.0, 0.0], dtype=np.float32)
-        else:
-            direction = direction / norm
-
         delta = self.ball.position - actor.position
         dist = float(np.linalg.norm(delta))
         if dist >= min_dist:
             return
-        self.ball.position = self._clip_ball_position(actor.position + direction * min_dist)
+        if dist > 1e-8:
+            direction = delta / dist
+        else:
+            direction = np.asarray(preferred_dir, dtype=np.float32)
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-8:
+                direction = np.asarray([1.0, 0.0], dtype=np.float32)
+            else:
+                direction = direction / norm
+        separated = actor.position + direction * min_dist
+        if self.params.end_on_ball_out:
+            self.ball.position = np.asarray(separated, dtype=np.float32)
+        else:
+            self.ball.position = self._clip_ball_position(separated)
 
     def _build_state(self) -> Dict:
         return {
