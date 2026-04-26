@@ -1,2 +1,2 @@
 # feature
-subgoal: chase ball
+subgoal: chase ball,pass ball and trap ball
