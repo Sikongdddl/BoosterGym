@@ -277,15 +277,18 @@ rewards:
   feet_distance_ref: 0.2
 
 curriculum:
-  r_min: 0.6
-  r_max: 1.0
+  r_min: 1.30
+  r_max: 1.60
+  pass_target_r_min: 1.30  # passBall 目标点距离下限（m）
+  pass_target_r_max: 1.60  # passBall 目标点距离上限（m）
+  pass_target_theta_half_deg: 30.0  # passBall 目标点角度半宽（相对机器人朝向，±30°）
   warmup_episodes: 800
-  warmup_r_min: 0.35
-  warmup_r_max: 0.70
+  warmup_r_min: 1.30
+  warmup_r_max: 1.60
   inc: 0.3
   dec: 0.2
-  r_max_cap: 15.0
-  r_max_floor: 1.0
+  r_max_cap: 1.60
+  r_max_floor: 1.30
   high_thresh: 0.7
   high_thresh_curr: 0.7
   low_thresh: 0.5
@@ -300,3 +303,63 @@ curriculum:
   sample_success_bonus: 1.6
   sample_hard_focus: 0.2
   sample_rmax_ema_beta: 0.97
+  reward_stages:
+    enabled: true
+    initial_stage: 0
+    success_window: 80
+    stage_min_episodes: [80, 100, 100, 0]
+    stage_success_thresholds: [0.75, 0.70, 0.70]
+    stage_names: ["close_ball", "align", "touch", "precise_pass"]
+    stage2_success_metric: "touch"  # touch | coarse
+    stage_mix_probs:
+      - [1.00, 0.00, 0.00, 0.00]
+      - [0.20, 0.80, 0.00, 0.00]
+      - [0.05, 0.55, 0.40, 0.00]
+      - [0.05, 0.10, 0.15, 0.70]
+    stage_mix_focus_start_ratio: 0.55
+    stage_mix_focus_max: [1.00, 0.90, 0.85, 0.90]
+    stage_rollback_min_episodes: [0, 0, 120, 160]
+    stage_rollback_thresholds: [0.00, 0.00, 0.20, 0.18]
+    close_dist_thresh: 1.60
+    align_dist_thresh: 0.50
+    align_robot_cos_thresh: 0.50
+    align_hold_steps: 6          # align 成功需连续满足的帧数
+    align_hold_dist_thresh: 0.50 # align 连续判定时的距离阈值
+    ball_spawn_min_dist: 0.20    # 回合初始摆球最小距离（相对机器人基座）
+    ball_spawn_max_dist: 0.60    # 回合初始摆球最大距离（相对机器人基座）
+    ball_spawn_theta_min_deg: -20.0  # 相对机器人朝向
+    ball_spawn_theta_max_deg: 20.0   # 相对机器人朝向
+    align_line_thresh: 0.25
+    align_approach_thresh: 0.35
+    ball_release_speed_thresh: 0.35
+    valid_hit_speed_thresh: 0.14
+    valid_hit_gain_thresh: 0.05
+    stage2_release_quality_thresh: 0.45
+    stage2_kick_dir_thresh: 0.45    # touch阶段：击球方向阈值（ball_align_cos）
+    stage2_kick_vpara_thresh: 0.35  # touch阶段：沿目标方向速度阈值
+    stage2_kick_vratio_thresh: 0.80 # touch阶段：侧向速度比例上限
+    stage01_touch_line_thresh: 0.55      # stage0/1 首触球方向阈值(line)
+    stage01_touch_approach_thresh: 0.60  # stage0/1 首触球方向阈值(approach)
+    stage01_touch_robot_thresh: 0.35     # stage0/1 首触球方向阈值(robot_align_cos)
+    stage0_touch_dir_bonus: 0.80         # stage0 正方向触球奖励
+    stage1_touch_dir_bonus: 1.30         # stage1 正方向触球奖励
+    stage01_wrong_touch_penalty: 0.60    # stage0/1 错方向触球惩罚
+    stage2_kick_dir_speed_scale: 2.8      # 方向*前向速度奖励系数（更看重沿目标方向踢）
+    stage2_kick_vperp_penalty_scale: 1.6  # 侧向速度惩罚系数（抑制“擦球偏飞”）
+    stage2_long_kick_scale: 1.8           # 远踢奖励系数（仅在方向门控下生效）
+    stage2_long_kick_vpara_target: 0.55   # 触球时希望达到的前向速度基线
+    stage2_dir_gate_margin: 0.10          # 方向门控平滑宽度（越小越硬）
+    stage2_bad_dir_penalty_scale: 1.2     # 方向不足额外惩罚
+    side_hit_line_reward_thresh: 0.55
+    coarse_success_radius: 0.75
+    precise_success_radius: 0.50
+    pre_touch_scale: [1.40, 1.10, 0.25, 0.10]
+    post_touch_scale: [0.00, 0.00, 0.60, 1.50]
+    touch_bonus_scale: [0.00, 0.00, 0.50, 0.10]
+    coarse_bonus_scale: [0.00, 0.00, 0.90, 0.15]
+    align_bonus_scale: [0.00, 1.00, 0.00, 0.00]
+    success_bonus_scale: [0.00, 0.00, 0.10, 1.50]
+    right_foot_pref_scale: 0.12      # stage2 触球前：右脚更靠近球的小额稠密奖励
+    right_foot_pref_margin: 0.08     # 距离差的平滑尺度（m），越小越“硬”
+    right_foot_touch_bonus: 0.60     # stage2 首次触球：右脚触球额外加分
+    left_foot_touch_penalty: 0.25    # stage2 首次触球：左脚触球小罚分

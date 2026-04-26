@@ -277,50 +277,78 @@ rewards:
   feet_distance_ref: 0.2
 
 curriculum:
-  r_min: 1.0
-  r_max: 1.5
-  inc: 0.3
-  dec: 0.2
-  r_max_cap: 15.0
-  r_max_floor: 1.2
-  high_thresh: 0.62
-  low_thresh: 0.3
-  high_thresh_curr: 0.62
-  min_episodes_at_level: 50
-  cooldown_episodes: 12
-  success_window: 80
-  angle_levels_deg: [20.0, 25.0, 30.0]
-  angle_initial_level: 0
-  angle_abs_min_deg: 15.0
-  trap_spawn_dist_min: 3.0
-  trap_spawn_dist_max: 4.0
-  trap_ball_speed_min: 0.8
-  trap_ball_speed_max: 1.6
-  target_reach_radius: 0.3
-  target_stop_speed: 0.22
-  target_stop_hold_steps: 2
-  target_speed_gate_dist: 1.2
-  target_brake_zone: 1.2
-  target_brake_weight: 0.6
-  trap_path_align_weight: 1.2
-  trap_forward_catch_weight: 0.9
-  trap_reverse_toward_penalty: 0.35
-  trap_pre_target_dash_weight: 1.0
-  trap_line_normal_speed_penalty: 0.25
-  trap_post_target_turn_weight: 0.9
-  trap_post_target_turn_penalty: 0.25
-  trap_post_target_gate_scale: 1.5
-  trap_post_target_face_incoming: true
-  trap_post_target_intercept_weight: 1.1
-  trap_post_target_reverse_penalty: 0.35
-  trap_reach_target_bonus: 18.0
-  trap_success_touch_after_target: true
-  trap_fall_penalty: 350.0
-  trap_fall_terminal_penalty: 120.0
-  trap_tilt_penalty_weight: 6.0
-  trap_tilt_safe_rad: 0.35
-  trap_vx_min: -0.2
-  trap_vx_max: 0.5
-  trap_cmd_smooth: 0.25
-  trap_action_repeat: 4
+  sample_sigma: 0.2
+  sample_epsilon: 0.1
+  sample_success_bonus: 1.2
+  sample_hard_focus: 0.0
+  sample_rmax_ema_beta: 0.9
+
+  dribble_vx_min: -0.10
+  dribble_vx_max: 0.60
+  dribble_cmd_smooth: 0.35
+  dribble_action_repeat: 10
+
+  dribble_stage_enabled: true
+  dribble_stage_initial: 0
+  dribble_stage_success_window: 100
+  # 课程成功分数 = clip(本轮最大连续控球步数 / 该目标值, 0, 1)
+  dribble_control_streak_target: 24
+  dribble_stage_min_episodes: 60
+  dribble_stage_cooldown: 12
+  dribble_stage_up_thresh: 0.65
+  dribble_stage_down_thresh: 0.30
+  dribble_w_control: [1.2, 0.95, 0.75]
+  dribble_w_turn: [0.1, 1.1, 0.9]
+  dribble_w_drive: [0.0, 0.35, 1.2]
+  dribble_w_soft_pass: [0.85, 1.15, 0.90]
+  dribble_w_reposition: [0.20, 0.90, 1.20]
+  dribble_w_ball_progress: [0.45, 0.65, 0.85]
+
+  # 场景难度课程（按 stage=0/1/2 生效）
+  # 若不填 *_stages，会回退到下面这些 base 键并自动生成三档默认值
+  dribble_target_dist_min: 2.0
+  dribble_target_dist_max: 3.0
+  dribble_target_angle_abs_min_deg: 35.0
+  dribble_target_angle_abs_max_deg: 150.0
+  dribble_target_dist_min_stages: [2.0, 2.4, 2.8]
+  dribble_target_dist_max_stages: [3.0, 3.5, 4.0]
+  dribble_target_angle_abs_min_deg_stages: [20.0, 35.0, 55.0]
+  dribble_target_angle_abs_max_deg_stages: [110.0, 150.0, 170.0]
+
+  dribble_ball_spawn_dist_min: 0.25
+  dribble_ball_spawn_dist_max: 0.42
+  dribble_ball_spawn_lateral_abs: 0.12
+  dribble_ball_spawn_dist_min_stages: [0.22, 0.25, 0.30]
+  dribble_ball_spawn_dist_max_stages: [0.36, 0.42, 0.50]
+  dribble_ball_spawn_lateral_abs_stages: [0.07, 0.12, 0.20]
+
+  dribble_control_dist: 0.55
+  dribble_control_front_min: 0.04
+  dribble_control_lateral_max: 0.30
+  dribble_control_hold_steps: 6
+  dribble_success_target_radius: 0.45
+  dribble_success_target_hold_steps: 6
+
+  dribble_heading_gate_cos: 0.70
+  dribble_pass_speed_ref: 0.85
+  dribble_pass_speed_sigma: 0.30
+  dribble_pass_reposition_min_toward: 0.12
+  dribble_reposition_front_ref: 0.20
+  dribble_reposition_front_sigma: 0.16
+  dribble_reposition_lateral_sigma: 0.22
+
+  dribble_spin_yaw_thr: 1.2
+  dribble_ball_speed_soft: 1.8
+  dribble_ball_rel_speed_soft: 1.4
+  dribble_lost_ball_soft: 0.95
+  dribble_fail_ball_dist: 1.6
+
+  dribble_time_penalty: 0.010
+  dribble_spin_penalty_scale: 0.25
+  dribble_ball_speed_penalty_scale: 0.18
+  dribble_rel_speed_penalty_scale: 0.12
+  dribble_lost_ball_penalty_scale: 0.75
+  dribble_fall_penalty: 18.0
+  dribble_fail_penalty: 6.0
+  dribble_success_bonus: 8.0
  

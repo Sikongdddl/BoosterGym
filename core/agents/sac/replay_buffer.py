@@ -9,8 +9,72 @@ class ReplayBuffer:
         self.buf = deque(maxlen=capacity)
         self.capacity = capacity
         self.total_pushes = 0  # 全局计数器，记录总共 push 了多少 transition（不受 capacity 限制）
+        self._compat_normalized = True
+
+    @staticmethod
+    def _normalize_transition(t):
+        if isinstance(t, np.ndarray) and t.dtype == object:
+            t = t.tolist()
+        if not isinstance(t, (tuple, list)):
+            raise TypeError(f"transition must be tuple/list, got {type(t)}")
+        if len(t) < 5:
+            raise ValueError(f"transition expects at least 5 fields, got {len(t)}")
+
+        s, a, r, s2, d = t[:5]
+        note = t[5] if len(t) >= 6 else ""
+        difficulty = t[6] if len(t) >= 7 else None
+        success = t[7] if len(t) >= 8 else False
+
+        return (
+            np.asarray(s, dtype=np.float32),
+            np.asarray(a, dtype=np.float32),
+            float(r),
+            np.asarray(s2, dtype=np.float32),
+            bool(d),
+            str(note),
+            difficulty,
+            bool(success),
+        )
+
+    def _ensure_compat(self):
+        """
+        兼容旧版 checkpoint:
+        - 旧对象可能缺少 total_pushes / capacity / _compat_normalized
+        - 旧 transition 可能只有 5/6/7 个字段（无 note/difficulty/success）
+        """
+        if not hasattr(self, "capacity") or self.capacity is None:
+            self.capacity = 200000
+
+        if not hasattr(self, "buf") or self.buf is None:
+            self.buf = deque(maxlen=int(self.capacity))
+        elif not isinstance(self.buf, deque):
+            self.buf = deque(list(self.buf), maxlen=int(self.capacity))
+
+        if not hasattr(self, "total_pushes") or self.total_pushes is None:
+            self.total_pushes = len(self.buf)
+
+        if not hasattr(self, "_compat_normalized"):
+            self._compat_normalized = False
+
+        if not self._compat_normalized:
+            maxlen = self.buf.maxlen if self.buf.maxlen is not None else int(self.capacity)
+            normalized = []
+            dropped = 0
+            for item in list(self.buf):
+                try:
+                    normalized.append(self._normalize_transition(item))
+                except Exception:
+                    dropped += 1
+            if dropped > 0:
+                print(f"[ReplayBuffer] dropped {dropped} malformed legacy transitions during compatibility migration.")
+            self.buf = deque(normalized, maxlen=maxlen)
+            self._compat_normalized = True
+
+        if self.total_pushes < len(self.buf):
+            self.total_pushes = len(self.buf)
 
     def push(self, s, a, r, s2, d, note="", difficulty=None, success=False):
+        self._ensure_compat()
         transition = (
             np.asarray(s, dtype=np.float32),
             np.asarray(a, dtype=np.float32),
@@ -28,6 +92,7 @@ class ReplayBuffer:
         return tid  # 全局 ID
 
     def sample(self, batch_size, r_min=None, r_max=None, sigma=0.2, epsilon=0.1, success_bonus=1.2, hard_focus=0.0):
+        self._ensure_compat()
         use_weighted = (r_min is not None) and (r_max is not None)
         hard_focus = float(hard_focus)
 
@@ -71,10 +136,12 @@ class ReplayBuffer:
         return s, a, r, s2, d, notes, difficulties, successes
 
     def __len__(self):
+        self._ensure_compat()
         return len(self.buf)
 
     def debug_print(self, n=5):
         """随机打印 n 条样本，帮助你直观查看 buffer 结构。"""
+        self._ensure_compat()
         if len(self.buf) == 0:
             print("\n[ReplayBuffer] empty.")
             return
@@ -105,6 +172,7 @@ class ReplayBuffer:
         保存字段：
             s, a, r, s2, d, notes, difficulties, successes
         """
+        self._ensure_compat()
         os.makedirs(save_dir, exist_ok=True)
 
         if filename is None:
@@ -159,6 +227,7 @@ class ReplayBuffer:
         把全局 transition id 映射到当前 deque 下标。
         如果已经因为 maxlen 被丢弃，则返回 None。
         """
+        self._ensure_compat()
         n = self.total_pushes
         L = len(self.buf)
 

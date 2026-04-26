@@ -67,12 +67,42 @@ class SACAgent(BaseAgent):
         self.action_low = torch.as_tensor(action_low, dtype=torch.float32, device=device)
         self.action_high = torch.as_tensor(action_high, dtype=torch.float32, device=device)
 
+    def _ensure_runtime_attrs(self):
+        """
+        兼容旧版 checkpoint 反序列化后的 SACAgent：
+        某些新字段在旧对象里不存在，这里补默认值，避免训练中 AttributeError。
+        """
+        if not hasattr(self, "sample_sigma"):
+            self.sample_sigma = 0.2
+        if not hasattr(self, "sample_epsilon"):
+            self.sample_epsilon = 0.1
+        if not hasattr(self, "sample_success_bonus"):
+            self.sample_success_bonus = 1.2
+        if not hasattr(self, "sample_hard_focus"):
+            self.sample_hard_focus = 0.0
+        if not hasattr(self, "sample_rmax_ema_beta"):
+            self.sample_rmax_ema_beta = 0.9
+        if not hasattr(self, "sample_rmax"):
+            self.sample_rmax = None
+
+        # 数值化，避免旧 checkpoint 中可能是字符串/np 标量导致后续异常
+        self.sample_sigma = float(self.sample_sigma)
+        self.sample_epsilon = float(self.sample_epsilon)
+        self.sample_success_bonus = float(self.sample_success_bonus)
+        self.sample_hard_focus = float(self.sample_hard_focus)
+        self.sample_rmax_ema_beta = float(self.sample_rmax_ema_beta)
+
+        # 兼容旧 buffer（无 total_pushes / 旧 transition 结构）
+        if hasattr(self, "replay_buffer") and hasattr(self.replay_buffer, "_ensure_compat"):
+            self.replay_buffer._ensure_compat()
+
     # 将 tanh(-1,1) 空间动作缩放到物理范围
     def _scale_action(self, a_tanh):
         # a_tanh: torch.Tensor [..., action_dim] in (-1,1)
         return (self.action_high + self.action_low)/2.0 + a_tanh * (self.action_high - self.action_low)/2.0
 
     def select_action(self, state, eval_mode=False):
+        self._ensure_runtime_attrs()
         s = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             a_tanh, _, a_mean = self.policy.sample(s)
@@ -81,9 +111,11 @@ class SACAgent(BaseAgent):
         return a_scaled.cpu().numpy()
 
     def push(self, *args):
+        self._ensure_runtime_attrs()
         self.replay_buffer.push(*args)
 
     def update(self, r_min=None, r_max=None):
+        self._ensure_runtime_attrs()
         if len(self.replay_buffer) < self.batch_size:
             return False, None
 

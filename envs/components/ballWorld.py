@@ -82,12 +82,18 @@ class BallWorld:
 
         self.set_pose(root_states, (x, y, z), zero_velocity=True)
 
-    def reset_pass_ball(self, root_states: torch.Tensor,
-                        base_xy=None, z: float = None):
+    def reset_pass_ball(
+        self,
+        root_states: torch.Tensor,
+        base_xy=None,
+        z: float = None,
+        r_min: float = 0.2,
+        r_max: float = 1.0,
+        theta_range: tuple = (-np.pi, np.pi),
+    ):
         """
-        专门给 passBall 用的摆球逻辑（新版）：
-        打桩实现，球固定生成在机器人面前。
-        真正的任务难度由 target 的位置决定。
+        专门给 passBall 用的摆球逻辑：
+        球随机生成在机器人附近（默认 1m 内）。
         """
         # 机器人基准位置
         if base_xy is None:
@@ -98,11 +104,17 @@ class BallWorld:
 
         z = self.default_z if z is None else float(z)
 
-        # 固定球离机器人“脚下不远”的距离
-        BALL_DIST = 0.6  # 单位：米
-
-        x = base_x + BALL_DIST
-        y = base_y
+        r0 = float(r_min)
+        r1 = float(r_max)
+        if r1 < r0:
+            r0, r1 = r1, r0
+        theta0, theta1 = float(theta_range[0]), float(theta_range[1])
+        if theta1 < theta0:
+            theta0, theta1 = theta1, theta0
+        theta = np.random.uniform(theta0, theta1)
+        radius = np.random.uniform(r0, r1)
+        x = base_x + radius * np.cos(theta)
+        y = base_y + radius * np.sin(theta)
 
         self.set_pose(root_states, (x, y, z), zero_velocity=True)
         

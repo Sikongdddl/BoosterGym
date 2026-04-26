@@ -7,4 +7,11 @@ runs/**
 # python cache
 __pycache__/
 
+# local runtime/build artifacts
+.codex
+.torch_extensions/
+
+# generated media and model checkpoints
+*.mp4
+*.pt
 

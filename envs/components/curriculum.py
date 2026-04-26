@@ -117,7 +117,9 @@ class CurriculumPolicy:
         elif rate < low:
             frac = min(1.0, max(0.0, (low - rate) / max(1e-6, low)))
             delta = dec_max * frac
-            self.r_max = max(self.r_max - delta, floor)
+            # 防止配置 floor 高于当前 r_max 时，"降难" 分支反向抬高 r_max
+            safe_floor = min(floor, self.r_max)
+            self.r_max = max(self.r_max - delta, safe_floor)
         # 介于阈值之间不变
 
         return self.r_min, self.r_max
@@ -177,7 +179,9 @@ class CurriculumPolicy:
         if not self._warmup_done:
             info = {
                 "rate_global": float(rate_g),
+                "rate_global_raw": float(rate_g_raw),
                 "rate_curr": float(rate_c),
+                "rate_curr_raw": float(rate_c_raw),
                 "episodes_at_level": int(self._episodes_at_level),
                 "successes_at_level": int(self._successes_at_level),
                 "changed": False,
@@ -188,18 +192,17 @@ class CurriculumPolicy:
             }
             if (episode_idx + 1) >= self.warmup_episodes:
                 self._warmup_done = True
-                self.r_min = float(self.base_r_min)
-                self.r_max = float(self.base_r_max)
+                # Warmup 结束后不自动上调 r_max，避免与最终成功率驱动冲突
                 self._reset_stats(reset_global=True)
                 self._last_change_ep = int(episode_idx)
                 info.update({
-                    "changed": True,
-                    "reason": "warmup-end",
+                    "changed": False,
+                    "reason": "warmup-end-await-final-success",
                     "phase": "main",
                     "r_min": float(self.r_min),
                     "r_max": float(self.r_max),
                 })
-                return float(self.r_min), float(self.r_max), True, info
+                return float(self.r_min), float(self.r_max), False, info
             return float(self.r_min), float(self.r_max), False, info
 
         # ===== 可选：按目标成功率稳态调节（围绕 target_success） =====
@@ -252,14 +255,18 @@ class CurriculumPolicy:
                 frac = min(1.0, max(0.0, (low_g - rate_c) / max(1e-6, low_g)))
                 delta = dec_max * frac
                 if delta > 0:
-                    self.r_max = max(self.r_max - delta, floor)
+                    # 防止 floor 配置高于当前值导致 down 分支反向上调
+                    safe_floor = min(floor, self.r_max)
+                    self.r_max = max(self.r_max - delta, safe_floor)
                     changed = True
                     reason = f"down:{delta:.3f} (rc={rate_c:.3f})"
                     self._after_change(episode_idx)
 
         info = {
             "rate_global": float(rate_g),
+            "rate_global_raw": float(rate_g_raw),
             "rate_curr": float(rate_c),
+            "rate_curr_raw": float(rate_c_raw),
             "episodes_at_level": int(self._episodes_at_level),
             "successes_at_level": int(self._successes_at_level),
             "changed": bool(changed),

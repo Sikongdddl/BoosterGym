@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from collections import deque
 from isaacgym import gymtorch
 from isaacgym.torch_utils import (
     get_axis_params,
@@ -24,6 +25,7 @@ class PassBallEnv:
         self.curriculum = CurriculumPolicy.from_dict(self.controller.cfg.get("curriculum"))
         self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
         self._last_curr_info: Optional[Dict] = None  # 记录最近一次课程信息，便于runner取数
+        self._init_reward_stage_curriculum()
 
     def _init_buffers(self):
         cfg = self.controller.cfg
@@ -63,6 +65,9 @@ class PassBallEnv:
 
         # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        # BaseTask.render() 会在 controller 上读取 root_states 来做相机跟随/录制
+        # 这里显式透传，避免 headless 录像时报属性缺失
+        self.controller.root_states = self.root_states
         
         # we only care robot states instead of other assets now so:
         self.root_states_robot = self.root_states[0:1,:]  
@@ -108,6 +113,173 @@ class PassBallEnv:
                     found = True
             if not found:
                 self.default_dof_pos[:, i] = cfg["init_state"]["default_joint_angles"]["default"]
+
+    def _init_reward_stage_curriculum(self):
+        curr_cfg = self.controller.cfg.get("curriculum", {})
+        stage_cfg = dict(curr_cfg.get("reward_stages", {}))
+        self._reward_stage_cfg = {
+            "enabled": True,
+            "initial_stage": 0,
+            "success_window": 80,
+            "stage_min_episodes": [80, 100, 100, 0],
+            "stage_success_thresholds": [0.75, 0.70, 0.70],
+            "stage_names": ["close_ball", "align", "touch", "precise_pass"],
+            "stage2_success_metric": "touch",
+            "stage_mix_probs": [
+                [1.00, 0.00, 0.00, 0.00],
+                [0.20, 0.80, 0.00, 0.00],
+                [0.05, 0.55, 0.40, 0.00],
+                [0.05, 0.10, 0.15, 0.70],
+            ],
+            "stage_rollback_min_episodes": [0, 0, 120, 160],
+            "stage_rollback_thresholds": [0.00, 0.00, 0.20, 0.18],
+            "close_dist_thresh": 1.60,
+            "align_hold_steps": 6,
+            "align_line_thresh": 0.25,
+            "align_approach_thresh": 0.35,
+            "align_robot_cos_thresh": 0.50,
+            "stage2_kick_dir_thresh": 0.45,
+            "stage2_kick_vpara_thresh": 0.35,
+            "stage2_kick_vratio_thresh": 0.80,
+            "pre_touch_scale": [1.40, 1.10, 0.25, 0.10],
+            "post_touch_scale": [0.00, 0.00, 0.60, 1.50],
+            "touch_bonus_scale": [0.00, 0.00, 0.50, 0.10],
+            "align_bonus_scale": [0.00, 1.00, 0.00, 0.00],
+            "success_bonus_scale": [0.00, 0.00, 0.10, 1.50],
+        }
+        self._reward_stage_cfg.update(stage_cfg)
+
+        self.reward_stage_enabled = bool(self._reward_stage_cfg.get("enabled", True))
+        default_stage_names = ["close_ball", "align", "touch", "precise_pass"]
+        self._num_reward_stages = len(self._reward_stage_cfg.get("stage_names", default_stage_names))
+        self.max_reward_stage = int(self._reward_stage_cfg.get("initial_stage", 0))
+        self.max_reward_stage = max(0, min(self.max_reward_stage, self._num_reward_stages - 1))
+        self.reward_stage = self.max_reward_stage
+        self._reward_stage_episode_count = 0
+        self._success_hist = deque(maxlen=int(self._reward_stage_cfg.get("success_window", 80)))
+        self._episode_close_success = False
+        self._episode_align_success = False
+        self._episode_touch_success = False
+        self._episode_coarse_success = False
+        self._episode_precise_success = False
+        self._align_hold_counter = 0
+        self._touch_count = 0
+        self._touch_now_prev = False
+
+    def _reward_stage_value(self, key: str) -> float:
+        values = self._reward_stage_cfg.get(key, [1.0] * self._num_reward_stages)
+        if isinstance(values, (list, tuple)) and len(values) >= self._num_reward_stages:
+            return float(values[self.reward_stage])
+        return float(values)
+
+    def _reward_stage_name(self) -> str:
+        names = self._reward_stage_cfg.get("stage_names", ["close_ball", "align", "touch", "precise_pass"])
+        if isinstance(names, (list, tuple)) and len(names) >= self._num_reward_stages:
+            return str(names[self.reward_stage])
+        return str(self.reward_stage)
+
+    def _sample_reward_stage_for_episode(self) -> int:
+        if not self.reward_stage_enabled:
+            return int(self.max_reward_stage)
+        mix_cfg = self._reward_stage_cfg.get("stage_mix_probs", [])
+        if (
+            isinstance(mix_cfg, (list, tuple))
+            and len(mix_cfg) > self.max_reward_stage
+            and isinstance(mix_cfg[self.max_reward_stage], (list, tuple))
+        ):
+            probs = np.asarray(mix_cfg[self.max_reward_stage], dtype=np.float64)
+        else:
+            probs = np.zeros(self._num_reward_stages, dtype=np.float64)
+            probs[: self.max_reward_stage + 1] = 1.0
+        if probs.shape[0] < self._num_reward_stages:
+            probs = np.pad(probs, (0, self._num_reward_stages - probs.shape[0]))
+        probs[self.max_reward_stage + 1 :] = 0.0
+        probs = np.clip(probs, 0.0, None)
+        if float(probs.sum()) <= 0.0:
+            probs = np.zeros(self._num_reward_stages, dtype=np.float64)
+            probs[self.max_reward_stage] = 1.0
+        probs = probs / probs.sum()
+        return int(np.random.choice(np.arange(self._num_reward_stages), p=probs))
+
+    def _stage_success_flag(self, stage_idx: int) -> bool:
+        if stage_idx <= 0:
+            return bool(self._episode_close_success)
+        if stage_idx == 1:
+            return bool(self._episode_align_success)
+        if stage_idx == 2:
+            stage2_metric = str(self._reward_stage_cfg.get("stage2_success_metric", "touch")).lower()
+            if stage2_metric in ("touch", "valid_hit", "hit"):
+                return bool(self._episode_touch_success)
+            return bool(self._episode_coarse_success)
+        return bool(self._episode_precise_success)
+
+    def _reward_stage_snapshot(self) -> Dict:
+        has_samples = len(self._success_hist) > 0
+        success_rate = float(sum(self._success_hist) / len(self._success_hist)) if has_samples else float("nan")
+        stage_names = self._reward_stage_cfg.get("stage_names", ["close_ball", "align", "touch", "precise_pass"])
+        return {
+            "reward_stage": float(self.reward_stage),
+            "reward_stage_name": self._reward_stage_name(),
+            "reward_stage_max": float(self.max_reward_stage),
+            "reward_stage_max_name": str(stage_names[self.max_reward_stage]),
+            "stage_success_rate": success_rate,
+            "stage_success_rate_valid": float(1.0 if has_samples else 0.0),
+            "episodes_in_reward_stage": float(self._reward_stage_episode_count),
+        }
+
+    def _update_reward_stage_curriculum(self, task_success: bool, episode_idx: int) -> Dict:
+        frontier_stage = int(self.max_reward_stage)
+        sampled_stage = int(self.reward_stage)
+        frontier_success = bool(self._stage_success_flag(frontier_stage))
+        active_stage_success = bool(self._stage_success_flag(sampled_stage))
+        sampled_frontier = sampled_stage == frontier_stage
+
+        changed = False
+        reason = None
+        prev_stage = self.max_reward_stage
+        if sampled_frontier:
+            self._success_hist.append(1 if frontier_success else 0)
+            self._reward_stage_episode_count += 1
+
+        success_rate = float(sum(self._success_hist) / len(self._success_hist)) if self._success_hist else 0.0
+        if self.reward_stage_enabled:
+            thresholds = list(self._reward_stage_cfg.get("stage_success_thresholds", [0.60] * (self._num_reward_stages - 1)))
+            min_episodes = list(self._reward_stage_cfg.get("stage_min_episodes", [40] * self._num_reward_stages))
+            rollback_min_episodes = list(self._reward_stage_cfg.get("stage_rollback_min_episodes", [0] * self._num_reward_stages))
+            rollback_thresholds = list(self._reward_stage_cfg.get("stage_rollback_thresholds", [0.0] * self._num_reward_stages))
+            if frontier_stage < self._num_reward_stages - 1:
+                min_eps = int(min_episodes[min(frontier_stage, len(min_episodes) - 1)])
+                thresh = float(thresholds[min(frontier_stage, len(thresholds) - 1)])
+                if sampled_frontier and self._reward_stage_episode_count >= min_eps and success_rate >= thresh:
+                    self.max_reward_stage = min(frontier_stage + 1, self._num_reward_stages - 1)
+                    changed = True
+                    reason = f"reward-stage-up:{frontier_stage}->{self.max_reward_stage} (stage_success_rate={success_rate:.3f})"
+            if (not changed) and frontier_stage > 0:
+                rollback_min_eps = int(rollback_min_episodes[min(frontier_stage, len(rollback_min_episodes) - 1)])
+                rollback_thresh = float(rollback_thresholds[min(frontier_stage, len(rollback_thresholds) - 1)])
+                if sampled_frontier and rollback_min_eps > 0 and self._reward_stage_episode_count >= rollback_min_eps and success_rate < rollback_thresh:
+                    self.max_reward_stage = max(frontier_stage - 1, 0)
+                    changed = True
+                    reason = f"reward-stage-down:{frontier_stage}->{self.max_reward_stage} (stage_success_rate={success_rate:.3f})"
+
+        if changed:
+            self._reward_stage_episode_count = 0
+            self._success_hist.clear()
+
+        info = self._reward_stage_snapshot()
+        info.update({
+            "reward_stage_changed": bool(changed),
+            "reward_stage_prev": float(prev_stage),
+            "reward_stage_reason": reason,
+            "episode_sampled_stage": float(sampled_stage),
+            "episode_frontier_stage": float(frontier_stage),
+            "episode_stage_success": float(active_stage_success),
+            "episode_frontier_stage_success": float(frontier_success),
+            "episode_task_success": float(bool(task_success)),
+            "episode_touch": float(bool(self._episode_touch_success)),
+            "episode_success": float(bool(task_success)),
+        })
+        return info
     # 根据权重调整采样策略
     def on_episode_end(self, success: bool, episode_idx: int) -> Tuple[float, float, bool, Dict]:
         """
@@ -117,12 +289,20 @@ class PassBallEnv:
         - changed: 本次是否调整了 r_max
         - info: 包含 rate_global/rate_curr/episodes_at_level 等统计
         """
+        stage_info = self._update_reward_stage_curriculum(success, episode_idx)
         r_min, r_max, changed, info = self.curriculum.update_on_episode_end(success, episode_idx)
         self.cur_r_min, self.cur_r_max = r_min, r_max
-        self._last_curr_info = dict(info)
+        merged_info = dict(info)
+        merged_info.update(stage_info)
+        self._last_curr_info = dict(merged_info)
         if changed:
             print(f"[Curriculum] ep#{episode_idx} r_max -> {self.cur_r_max:.2f} | {info.get('reason')}")
-        return r_min, r_max, changed, info
+        if bool(stage_info.get("reward_stage_changed", False)):
+            print(
+                f"[RewardStage] ep#{episode_idx} -> {int(stage_info.get('reward_stage_max', self.max_reward_stage))} "
+                f"({stage_info.get('reward_stage_reason')})"
+            )
+        return r_min, r_max, changed, merged_info
 
     def reset(self):
         obs, infos = self.controller.reset(
@@ -136,14 +316,35 @@ class PassBallEnv:
         
         self.cur_r_min, self.cur_r_max = self.curriculum.get_window()
         base_xy = (float(self.root_states[0, 0].item()), float(self.root_states[0, 1].item()))
+        stage_cfg = self.controller.cfg.get("curriculum", {}).get("reward_stages", {})
+        ball_spawn_min = float(stage_cfg.get("ball_spawn_min_dist", 0.2))
+        ball_spawn_max = float(stage_cfg.get("ball_spawn_max_dist", 0.6))
+        theta_min_deg = float(stage_cfg.get("ball_spawn_theta_min_deg", -20.0))
+        theta_max_deg = float(stage_cfg.get("ball_spawn_theta_max_deg", 20.0))
+        fwd_local = torch.tensor([1.0, 0.0, 0.0], device=self.base_quat.device, dtype=self.base_quat.dtype)
+        fwd_world = quat_rotate(self.base_quat[0:1], fwd_local[None, :]).squeeze(0)
+        heading = float(torch.atan2(fwd_world[1], fwd_world[0]).item())
 
-        self.ball_world.reset_pass_ball(
+        self.ball_world.reset_pass_ball(           
             root_states=self.root_states,
             base_xy=base_xy,
-        )        
+            r_min=ball_spawn_min,
+            r_max=ball_spawn_max,
+            theta_range=(heading + np.deg2rad(theta_min_deg), heading + np.deg2rad(theta_max_deg)),
+        )
+        self.reward_stage = self._sample_reward_stage_for_episode()
         self._prev_dist_xy = None  # 重置进步奖励计算
         self._prev_ball_dist = None
+        self._prev_ball_speed = None
         self._has_touched_ball = False
+        self._touch_now_prev = False
+        self._touch_count = 0
+        self._align_hold_counter = 0
+        self._episode_close_success = False
+        self._episode_align_success = False
+        self._episode_touch_success = False
+        self._episode_coarse_success = False
+        self._episode_precise_success = False
         self._milestones_passed.clear()
         self.initial_dist_xy = None
 
@@ -174,7 +375,10 @@ class PassBallEnv:
             self.controller.gym.refresh_dof_force_tensor(self.controller.sim)
         self.torques /= self.controller.cfg["control"]["decimation"]
         
-        if getattr(self.controller, 'viewer', None) is not None:
+        if (
+            getattr(self.controller, "viewer", None) is not None
+            or bool(self.controller.cfg.get("viewer", {}).get("record_video", False))
+        ):
             self.controller.render()
 
     def post_step(self):
@@ -258,28 +462,31 @@ class PassBallEnv:
         ball_dist = torch.norm(delta_bt) + 1e-6      # 当前球到 target 的距离
         dir_bt = delta_bt / ball_dist                # 单位向量：球 -> target (2,)
 
-        # ========== 2. 机器人速度方向 vs 球->target 方向 ==========
+        # ========== 2. 机器人朝向/速度几何 ==========
+        # 2.0 机器人线速度（世界系）
         # base_lin_vel 当前是自车系，先旋回世界系
         v_body = self.base_lin_vel[0, :3]  # (3,)
         v_world = quat_rotate(self.base_quat[0:1], v_body[None, :]).squeeze(0)  # (3,)
         v_world_xy = v_world[:2]
 
-        robot_speed = torch.norm(v_world_xy)
-        robot_move_thresh = torch.tensor(0.1, device=device, dtype=dtype)  # 认为“在走”的最小速度
-
-        if robot_speed > robot_move_thresh:
-            v_dir = v_world_xy / (robot_speed + 1e-6)
-            robot_align_cos = torch.clamp(torch.dot(v_dir, dir_bt), -1.0, 1.0)
-            # 映射到 [0,1]，越对准球->target，值越接近 1
-            robot_align_reward = 0.5 * (robot_align_cos + 1.0)
-        else:
-            robot_align_cos = torch.tensor(0.0, device=device, dtype=dtype)
-            robot_align_reward = torch.tensor(0.0, device=device, dtype=dtype)
-
-        # ========== 2.1 机器人-球-目标三点共线 + 朝球前进（用于反制绕球刷分） ==========
+        # ========== 2.1 机器人-球-目标三点共线 + 面向球 + 朝球前进（用于反制绕球刷分） ==========
         delta_rb = ball_xy - robot_pos[:2]                  # 机器人 -> 球
         robot_to_ball_dist = torch.norm(delta_rb) + 1e-6
         dir_rb = delta_rb / robot_to_ball_dist
+
+        # 身体前向是否“面对球”
+        fwd_local = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+        fwd_world = quat_rotate(self.base_quat[0:1], fwd_local[None, :]).squeeze(0)
+        fwd_world_xy = fwd_world[:2]
+        fwd_norm = torch.norm(fwd_world_xy)
+        if fwd_norm > 1e-6:
+            fwd_dir = fwd_world_xy / (fwd_norm + 1e-6)
+            robot_align_cos = torch.clamp(torch.dot(fwd_dir, dir_rb), -1.0, 1.0)
+            # 仅奖励真正“朝向球”，侧向/背向不给正奖励
+            robot_align_reward = torch.clamp(robot_align_cos, 0.0, 1.0)
+        else:
+            robot_align_cos = torch.tensor(0.0, device=device, dtype=dtype)
+            robot_align_reward = torch.tensor(0.0, device=device, dtype=dtype)
 
         line_cos = torch.clamp(torch.dot(dir_rb, dir_bt), -1.0, 1.0)
         # 只奖励“机器人在球后方且球在目标方向上”的几何关系（cos>0）
@@ -287,7 +494,10 @@ class PassBallEnv:
         # 距离门控：离球越近，共线奖励越有效，避免远距离刷形状分
         line_dist_gate = torch.exp(-robot_to_ball_dist / 1.5)
 
+        robot_speed = torch.norm(v_world_xy)
+        robot_move_thresh = torch.tensor(0.1, device=device, dtype=dtype)  # 认为“在走”的最小速度
         if robot_speed > robot_move_thresh:
+            v_dir = v_world_xy / (robot_speed + 1e-6)
             approach_cos = torch.clamp(torch.dot(v_dir, dir_rb), -1.0, 1.0)
             approach_reward = 0.5 * (approach_cos + 1.0)
             tangentiality = torch.sqrt(torch.clamp(1.0 - approach_cos * approach_cos, min=0.0, max=1.0))
@@ -308,11 +518,15 @@ class PassBallEnv:
             ball_align_cos = torch.tensor(0.0, device=device, dtype=dtype)
             ball_align_reward = torch.tensor(0.0, device=device, dtype=dtype)
 
-        # ========== 4. 触球检测 & 奖励 ==========
-        touch_now = self.is_feet_contact_ball()  # 使用新的距离检测方法
+        # ========== 4. 触球检测 ==========
+        touch_now = self.is_feet_contact_ball()
+        prev_touch_now = bool(getattr(self, "_touch_now_prev", False))
+        touch_event = bool(touch_now and (not prev_touch_now))
+        if touch_event:
+            self._touch_count = int(getattr(self, "_touch_count", 0)) + 1
+        touch_count = int(getattr(self, "_touch_count", 0))
         prev_touched = getattr(self, "_has_touched_ball", False)
 
-        # 触球有效性判定：避免“仅靠距离阈值擦到球”就触发早停
         prev_ball_speed = getattr(self, "_prev_ball_speed", None)
         if prev_ball_speed is None:
             prev_ball_speed = torch.zeros((), device=device, dtype=dtype)
@@ -322,32 +536,77 @@ class PassBallEnv:
         valid_hit_now = bool(touch_now) and bool(
             ((ball_speed > hit_speed_thresh) or (ball_speed_gain > hit_gain_thresh)).item()
         )
-
         first_touch = (not prev_touched) and valid_hit_now
         if valid_hit_now:
             self._has_touched_ball = True
 
-        # 中等触球奖励：保留探索信号，但不再主导优化目标
-        r_touch = torch.tensor(
-            8.0 if first_touch else 0.0,
-            device=device, dtype=dtype
+        # ========== 5. 阶段成功判定 ==========
+        close_dist_thresh = torch.tensor(float(self._reward_stage_cfg.get("close_dist_thresh", 1.60)), device=device, dtype=dtype)
+        align_line_thresh = torch.tensor(float(self._reward_stage_cfg.get("align_line_thresh", 0.25)), device=device, dtype=dtype)
+        align_approach_thresh = torch.tensor(float(self._reward_stage_cfg.get("align_approach_thresh", 0.35)), device=device, dtype=dtype)
+        align_robot_cos_thresh = torch.tensor(float(self._reward_stage_cfg.get("align_robot_cos_thresh", 0.50)), device=device, dtype=dtype)
+        align_hold_steps = int(self._reward_stage_cfg.get("align_hold_steps", 6))
+
+        close_success_now = bool((robot_to_ball_dist < close_dist_thresh).item())
+        align_step_good = bool(
+            (
+                (robot_to_ball_dist < close_dist_thresh)
+                & (line_reward > align_line_thresh)
+                & (approach_reward > align_approach_thresh)
+                & (robot_align_cos > align_robot_cos_thresh)
+            ).item()
+        )
+        if align_step_good:
+            self._align_hold_counter = int(getattr(self, "_align_hold_counter", 0)) + 1
+        else:
+            self._align_hold_counter = 0
+        align_success_now = self._align_hold_counter >= max(1, align_hold_steps)
+        touch_success_now = bool(self._has_touched_ball)
+
+        v_para = torch.dot(ball_vel_xy, dir_bt)
+        v_perp = torch.norm(ball_vel_xy - v_para * dir_bt)
+        v_ratio = v_perp / (torch.abs(v_para) + 1e-6)
+        stage2_kick_dir_thresh = torch.tensor(float(self._reward_stage_cfg.get("stage2_kick_dir_thresh", 0.45)), device=device, dtype=dtype)
+        stage2_kick_vpara_thresh = torch.tensor(float(self._reward_stage_cfg.get("stage2_kick_vpara_thresh", 0.35)), device=device, dtype=dtype)
+        stage2_kick_vratio_thresh = torch.tensor(float(self._reward_stage_cfg.get("stage2_kick_vratio_thresh", 0.80)), device=device, dtype=dtype)
+        coarse_success_now = bool(touch_success_now) and bool(
+            ((ball_align_cos > stage2_kick_dir_thresh) & (v_para > stage2_kick_vpara_thresh) & (v_ratio < stage2_kick_vratio_thresh)).item()
         )
 
-        # ========== 5. 成功判定 ==========
-        success_thresh = 0.60  # 球进入这个半径算成功
-        success = bool((ball_dist < success_thresh).item())
-        r_succ = torch.tensor(
-            80.0 if success else 0.0,
-            device=device, dtype=dtype
-        )
+        success_thresh = 0.60
+        precise_success_now = bool((ball_dist < success_thresh).item())
 
-        # ========== 6. 时间 & 摔倒惩罚 ==========
-        time_penalty = torch.tensor(0.01, device=device, dtype=dtype)
-        fallen_penalty = torch.tensor(
-            10.0 if self.extras.get("fall", False) else 0.0,
-            device=device,
-            dtype=dtype,
-        )
+        self._episode_close_success = self._episode_close_success or close_success_now
+        self._episode_align_success = self._episode_align_success or align_success_now
+        self._episode_touch_success = self._episode_touch_success or touch_success_now
+        self._episode_coarse_success = self._episode_coarse_success or coarse_success_now
+        self._episode_precise_success = self._episode_precise_success or precise_success_now
+
+        stage_idx = int(self.reward_stage)
+        pre_scale = torch.tensor(self._reward_stage_value("pre_touch_scale"), device=device, dtype=dtype)
+        post_scale = torch.tensor(self._reward_stage_value("post_touch_scale"), device=device, dtype=dtype)
+        touch_scale = torch.tensor(self._reward_stage_value("touch_bonus_scale"), device=device, dtype=dtype)
+        align_scale = torch.tensor(self._reward_stage_value("align_bonus_scale"), device=device, dtype=dtype)
+        success_scale = torch.tensor(self._reward_stage_value("success_bonus_scale"), device=device, dtype=dtype)
+
+        # ========== 6. 分阶段奖励 ==========
+        r_robot = torch.zeros((), device=device, dtype=dtype)
+        r_approach = torch.zeros((), device=device, dtype=dtype)
+        r_line = torch.zeros((), device=device, dtype=dtype)
+        r_near_ball = torch.zeros((), device=device, dtype=dtype)
+        r_ball = torch.zeros((), device=device, dtype=dtype)
+        r_post_align = torch.zeros((), device=device, dtype=dtype)
+        r_post_dist = torch.zeros((), device=device, dtype=dtype)
+        r_progress = torch.zeros((), device=device, dtype=dtype)
+        r_touch = torch.zeros((), device=device, dtype=dtype)
+        r_succ = torch.zeros((), device=device, dtype=dtype)
+        r_align_bonus = torch.zeros((), device=device, dtype=dtype)
+
+        far_excess = torch.relu(robot_to_ball_dist - 3.0)
+        far_penalty = 8.0 * (torch.exp(1.2 * far_excess) - 1.0)
+        hack_gap = torch.relu(robot_align_reward - approach_reward)
+        hack_penalty = 0.35 * hack_gap + 0.15 * tangentiality * robot_align_reward
+        bad_touch_penalty = torch.zeros((), device=device, dtype=dtype)
 
         prev_ball_dist = getattr(self, "_prev_ball_dist", None)
         if prev_ball_dist is None:
@@ -355,56 +614,70 @@ class PassBallEnv:
         else:
             ball_progress = torch.clamp(prev_ball_dist - ball_dist, min=-0.30, max=0.30)
 
-        # ========== 7. 合成总奖励 ==========
-        # 触球前：重点学“接近球 + 站位 + 朝球接近”
-        if not prev_touched:
-            r_robot = 0.05 * robot_align_reward
-            r_approach = 0.45 * approach_reward
-            r_line = 0.45 * line_reward * line_dist_gate
-            r_near_ball = 0.50 * torch.exp(-robot_to_ball_dist / 0.8)
-            r_post_align = torch.zeros((), device=device, dtype=dtype)
-            r_post_dist = torch.zeros((), device=device, dtype=dtype)
-            r_progress = torch.zeros((), device=device, dtype=dtype)
-            # 更早抑制明显跑偏
-            far_excess = torch.relu(robot_to_ball_dist - 3.0)
-            far_penalty = 12.0 * (torch.exp(1.4 * far_excess) - 1.0)
-            # 反作弊：如果“朝 target 对齐”高，但“朝球接近”差，则惩罚
-            hack_gap = torch.relu(robot_align_reward - approach_reward)
-            hack_penalty = 0.45 * hack_gap + 0.20 * tangentiality * robot_align_reward
+        if stage_idx == 0:
+            # stage0: close_ball
+            r_near_ball = pre_scale * 0.90 * torch.exp(-robot_to_ball_dist / 0.8)
+            r_approach = pre_scale * 0.70 * approach_reward
+            r_line = pre_scale * 0.15 * line_reward * line_dist_gate
+            r_robot = pre_scale * 0.10 * robot_align_reward
+            if first_touch:
+                bad_touch_penalty = bad_touch_penalty + 0.40 * torch.relu(torch.tensor(0.55, device=device, dtype=dtype) - line_reward)
+        elif stage_idx == 1:
+            # stage1: align
+            r_near_ball = pre_scale * 0.45 * torch.exp(-robot_to_ball_dist / 0.9)
+            r_approach = pre_scale * 0.35 * approach_reward
+            r_line = pre_scale * 0.80 * line_reward * line_dist_gate
+            r_robot = pre_scale * 0.35 * robot_align_reward
+            if align_success_now:
+                r_align_bonus = 3.0 * align_scale
+        elif stage_idx == 2:
+            # stage2: touch
+            if not self._has_touched_ball:
+                r_near_ball = pre_scale * 0.45 * torch.exp(-robot_to_ball_dist / 0.9)
+                r_approach = pre_scale * 0.35 * approach_reward
+                r_line = pre_scale * 0.55 * line_reward * line_dist_gate
+                r_robot = pre_scale * 0.25 * robot_align_reward
+            if first_touch:
+                r_touch = 8.0 * touch_scale
+                kick_dir = torch.clamp(ball_align_cos, 0.0, 1.0)
+                kick_speed = torch.relu(v_para)
+                r_ball = 2.0 * kick_dir * kick_speed - 0.8 * v_perp
+                bad_touch_penalty = bad_touch_penalty + 0.8 * torch.relu(stage2_kick_dir_thresh - ball_align_cos)
         else:
-            r_robot = torch.zeros((), device=device, dtype=dtype)
-            r_approach = torch.zeros((), device=device, dtype=dtype)
-            r_line = torch.zeros((), device=device, dtype=dtype)
-            r_near_ball = torch.zeros((), device=device, dtype=dtype)
-            # 触球后持续约束球路质量，而不是只靠一次性事件奖励
+            # stage3: precise_pass
             speed_gate = torch.tanh(ball_speed / 1.5)
-            r_post_align = 1.20 * ball_align_reward * speed_gate
-            r_post_dist = 0.80 * torch.exp(-ball_dist / 0.9)
-            r_progress = 4.00 * ball_progress
-            far_penalty = torch.zeros((), device=device, dtype=dtype)
-            hack_penalty = torch.zeros((), device=device, dtype=dtype)
+            r_post_align = post_scale * 1.20 * ball_align_reward * speed_gate
+            r_post_dist = post_scale * 0.80 * torch.exp(-ball_dist / 0.9)
+            r_progress = post_scale * 4.00 * ball_progress
+            if first_touch:
+                r_touch = 2.0 * touch_scale
+            if precise_success_now:
+                r_succ = 80.0 * success_scale
 
-        # 首次触球时，轻度鼓励把球真正打起来
-        if first_touch:
-            r_ball = 1.20 * torch.tanh(ball_speed / 2.0)
-        else:
-            r_ball = torch.zeros((), device=device, dtype=dtype)
+        # 通用成功奖励（仅最终成功）
+        if precise_success_now and stage_idx < 3:
+            r_succ = 20.0 * success_scale
+
+        time_penalty = torch.tensor(0.01, device=device, dtype=dtype)
+        fallen_penalty = torch.tensor(10.0 if self.extras.get("fall", False) else 0.0, device=device, dtype=dtype)
 
         reward = (
-            r_robot   # 机器人速度方向奖励
-            + r_approach  # 朝球接近奖励
-            + r_line  # 三点共线奖励
-            + r_near_ball  # 接近球奖励
-            + r_ball  # 球速度方向奖励
-            + r_post_align  # 触球后球路朝向奖励
-            + r_post_dist  # 触球后球离目标的密集奖励
-            + r_progress  # 触球后球朝目标收敛的进步奖励
-            + r_touch # 一次性触球大额奖励
-            + r_succ  # 成功奖励
-            - far_penalty  # 远离球硬惩罚
-            - hack_penalty  # 反绕球惩罚
-            - time_penalty # 时间惩罚
-            - fallen_penalty # 摔倒惩罚 
+            r_robot
+            + r_approach
+            + r_line
+            + r_near_ball
+            + r_ball
+            + r_post_align
+            + r_post_dist
+            + r_progress
+            + r_touch
+            + r_align_bonus
+            + r_succ
+            - far_penalty
+            - hack_penalty
+            - bad_touch_penalty
+            - time_penalty
+            - fallen_penalty
         )
         reward_raw = reward
         reward = torch.clamp(reward_raw, min=-100.0, max=100.0)
@@ -413,55 +686,75 @@ class PassBallEnv:
         if "rew_terms" not in self.extras:
             self.extras["rew_terms"] = {}
         terms = self.extras["rew_terms"]
-
-        # 几何信息
-        terms["ball_dist"]         = ball_dist.detach()
-        terms["ball_speed"]        = ball_speed.detach()
-        terms["ball_align_cos"]    = ball_align_cos.detach()
+        terms["ball_dist"] = ball_dist.detach()
+        terms["ball_speed"] = ball_speed.detach()
+        terms["ball_align_cos"] = ball_align_cos.detach()
         terms["ball_align_reward"] = ball_align_reward.detach()
-
-        terms["robot_speed"]        = robot_speed.detach()
-        terms["robot_align_cos"]    = robot_align_cos.detach()
+        terms["robot_speed"] = robot_speed.detach()
+        terms["robot_align_cos"] = robot_align_cos.detach()
         terms["robot_align_reward"] = robot_align_reward.detach()
         terms["robot_to_ball_dist"] = robot_to_ball_dist.detach()
-        terms["line_cos"]           = line_cos.detach()
-        terms["line_reward"]        = line_reward.detach()
-        terms["line_dist_gate"]     = line_dist_gate.detach()
-        terms["approach_cos"]       = approach_cos.detach()
-        terms["approach_reward"]    = approach_reward.detach()
-
-        # 子 reward 分量
+        terms["line_cos"] = line_cos.detach()
+        terms["line_reward"] = line_reward.detach()
+        terms["line_dist_gate"] = line_dist_gate.detach()
+        terms["approach_cos"] = approach_cos.detach()
+        terms["approach_reward"] = approach_reward.detach()
+        terms["v_para"] = v_para.detach()
+        terms["v_perp"] = v_perp.detach()
+        terms["v_ratio"] = v_ratio.detach()
+        terms["align_step_good"] = torch.tensor(1.0 if align_step_good else 0.0, device=device, dtype=dtype)
+        terms["align_hold_counter"] = torch.tensor(float(self._align_hold_counter), device=device, dtype=dtype)
+        terms["align_hold_steps"] = torch.tensor(float(align_hold_steps), device=device, dtype=dtype)
+        terms["touch_count"] = torch.tensor(float(touch_count), device=device, dtype=dtype)
+        terms["touch_now"] = torch.tensor(1.0 if touch_now else 0.0, device=device, dtype=dtype)
+        terms["first_touch"] = torch.tensor(1.0 if first_touch else 0.0, device=device, dtype=dtype)
         terms["r_robot"] = r_robot.detach()
         terms["r_approach"] = r_approach.detach()
-        terms["r_line"]  = r_line.detach()
+        terms["r_line"] = r_line.detach()
         terms["r_near_ball"] = r_near_ball.detach()
-        terms["r_ball"]  = r_ball.detach()
+        terms["r_ball"] = r_ball.detach()
         terms["r_post_align"] = r_post_align.detach()
         terms["r_post_dist"] = r_post_dist.detach()
         terms["r_progress"] = r_progress.detach()
         terms["r_touch"] = r_touch.detach()
-        terms["r_succ"]  = r_succ.detach()
-        terms["far_penalty"]    = (-far_penalty).detach()
-        terms["hack_penalty"]   = (-hack_penalty).detach()
-        terms["time_penalty"]   = (-time_penalty).detach()
+        terms["r_align_bonus"] = r_align_bonus.detach()
+        terms["r_succ"] = r_succ.detach()
+        terms["far_penalty"] = (-far_penalty).detach()
+        terms["hack_penalty"] = (-hack_penalty).detach()
+        terms["side_hit_penalty"] = (-bad_touch_penalty).detach()
+        terms["time_penalty"] = (-time_penalty).detach()
         terms["fallen_penalty"] = (-fallen_penalty).detach()
-        terms["reward_raw"]     = reward_raw.detach()
+        terms["reward_raw"] = reward_raw.detach()
         terms["reward_clipped"] = reward.detach()
+        terms["reward_stage"] = torch.tensor(float(self.reward_stage), device=device, dtype=dtype)
+        terms["reward_stage_max"] = torch.tensor(float(self.max_reward_stage), device=device, dtype=dtype)
+        terms["reward_stage_pre_scale"] = pre_scale.detach()
+        terms["reward_stage_post_scale"] = post_scale.detach()
+        terms["reward_stage_touch_scale"] = touch_scale.detach()
+        terms["reward_stage_align_scale"] = align_scale.detach()
+        terms["reward_stage_success_scale"] = success_scale.detach()
+        terms["close_success"] = torch.tensor(1.0 if self._episode_close_success else 0.0, device=device, dtype=dtype)
+        terms["align_success"] = torch.tensor(1.0 if self._episode_align_success else 0.0, device=device, dtype=dtype)
+        terms["stage2_touch_success"] = torch.tensor(1.0 if self._episode_touch_success else 0.0, device=device, dtype=dtype)
+        terms["coarse_success"] = torch.tensor(1.0 if self._episode_coarse_success else 0.0, device=device, dtype=dtype)
+        terms["precise_success"] = torch.tensor(1.0 if self._episode_precise_success else 0.0, device=device, dtype=dtype)
+        terms["stage_success_active"] = torch.tensor(1.0 if self._stage_success_flag(self.reward_stage) else 0.0, device=device, dtype=dtype)
 
-        # 事件标记
-        terms["touch_now"] = torch.tensor(
-            1.0 if touch_now else 0.0,
-            device=device, dtype=dtype
-        )
-        terms["first_touch"] = torch.tensor(
-            1.0 if first_touch else 0.0,
-            device=device, dtype=dtype
-        )
-
-        self.extras["success"] = success
+        self.extras["success"] = bool(self._stage_success_flag(self.reward_stage))
+        self.extras["final_success"] = bool(self._episode_precise_success)
         self.extras["hit"] = bool(first_touch)
+        self.extras["reward_stage"] = int(self.reward_stage)
+        self.extras["reward_stage_name"] = self._reward_stage_name()
+        self.extras["reward_stage_max"] = int(self.max_reward_stage)
+        self.extras["close_success"] = bool(self._episode_close_success)
+        self.extras["align_success"] = bool(self._episode_align_success)
+        self.extras["stage2_touch_success"] = bool(self._episode_touch_success)
+        self.extras["coarse_success"] = bool(self._episode_coarse_success)
+        self.extras["precise_success"] = bool(self._episode_precise_success)
+
         self._prev_ball_speed = ball_speed.detach()
         self._prev_ball_dist = ball_dist.detach()
+        self._touch_now_prev = bool(touch_now)
 
         # ========== 9. 终端 debug 输出 ==========
         debug_flag = getattr(self, "debug_reward", False)
@@ -774,26 +1067,33 @@ class PassBallEnv:
         delta_bt = target_xy - ball_xy
         ball_dist = torch.norm(delta_bt) + 1e-6
         dir_bt = delta_bt / ball_dist
-        # 2. 机器人速度方向 vs 球->target
-        robot_speed = torch.norm(v_world_xy)
-        robot_move_thresh = torch.tensor(0.1, device=device, dtype=dtype)
-        if robot_speed > robot_move_thresh:
-            v_dir = v_world_xy / (robot_speed + 1e-6)
-            robot_align_cos = torch.clamp(torch.dot(v_dir, dir_bt), -1.0, 1.0)
-            robot_align_reward = 0.5 * (robot_align_cos + 1.0)
+        # 2. 机器人朝向/速度几何（与主奖励保持一致）
+        delta_rb = ball_xy - robot_pos
+        robot_to_ball_dist = torch.norm(delta_rb) + 1e-6
+        dir_rb = delta_rb / robot_to_ball_dist
+
+        # 面向球（身体朝向）
+        fwd_local = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+        fwd_world = quat_rotate(self.base_quat[0:1], fwd_local[None, :]).squeeze(0)
+        fwd_world_xy = fwd_world[:2]
+        fwd_norm = torch.norm(fwd_world_xy)
+        if fwd_norm > 1e-6:
+            fwd_dir = fwd_world_xy / (fwd_norm + 1e-6)
+            robot_align_cos = torch.clamp(torch.dot(fwd_dir, dir_rb), -1.0, 1.0)
+            robot_align_reward = torch.clamp(robot_align_cos, 0.0, 1.0)
         else:
             robot_align_cos = torch.tensor(0.0, device=device, dtype=dtype)
             robot_align_reward = torch.tensor(0.0, device=device, dtype=dtype)
 
-        # 2.1 三点共线 + 反绕球
-        delta_rb = ball_xy - robot_pos
-        robot_to_ball_dist = torch.norm(delta_rb) + 1e-6
-        dir_rb = delta_rb / robot_to_ball_dist
+        # 三点共线 + 朝球前进
         line_cos = torch.clamp(torch.dot(dir_rb, dir_bt), -1.0, 1.0)
         line_reward = torch.clamp(line_cos, 0.0, 1.0)
         line_dist_gate = torch.exp(-robot_to_ball_dist / 1.5)
 
+        robot_speed = torch.norm(v_world_xy)
+        robot_move_thresh = torch.tensor(0.1, device=device, dtype=dtype)
         if robot_speed > robot_move_thresh:
+            v_dir = v_world_xy / (robot_speed + 1e-6)
             approach_cos = torch.clamp(torch.dot(v_dir, dir_rb), -1.0, 1.0)
             approach_reward = 0.5 * (approach_cos + 1.0)
             tangentiality = torch.sqrt(torch.clamp(1.0 - approach_cos * approach_cos, min=0.0, max=1.0))
